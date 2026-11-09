@@ -6,6 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+
 import {
   View,
   Text,
@@ -18,8 +19,10 @@ import {
   ActivityIndicator,
   AppState,
 } from "react-native";
-import Sound from "react-native-sound";
+
+import Video from "react-native-video";
 import LinearGradient from "react-native-linear-gradient";
+
 import {
   ArrowLeft,
   Play,
@@ -35,11 +38,28 @@ import {
   Repeat2,
   ListMusic,
 } from "lucide-react-native";
+
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { supabase } from "../lib/supabase";
 
-// Enable playback in silent mode on iOS.
-Sound.setCategory("Playback");
+/**
+ * IMPORTANT:
+ * This must match the bucket name in Supabase Storage.
+ *
+ * For example:
+ * Bucket: wellness-audio
+ * Object: relaxing-piano.mp3
+ *
+ * If wellness-audio is a folder in another bucket,
+ * change this constant to the actual bucket name.
+ */
+const AUDIO_STORAGE_BUCKET = "wellness-audio";
+
+/**
+ * Signed URLs are valid for one hour.
+ * The player generates a URL when a track is selected.
+ */
+const SIGNED_URL_LIFETIME_SECONDS = 60 * 60;
 
 type Track = {
   id: string;
@@ -64,6 +84,94 @@ type Props = {
   onClose: (completed: boolean) => void;
 };
 
+/**
+ * Resolves either:
+ *
+ * 1. A complete HTTPS audio URL.
+ * 2. "wellness-audio/relaxing-piano.mp3"
+ * 3. "relaxing-piano.mp3" (object path inside the configured bucket).
+ *
+ * It first tries to generate a signed URL for private buckets.
+ * If that fails, it falls back to the public URL format.
+ *
+ * A returned URL is not proof that the file exists. Video.onError
+ * handles missing files, inaccessible objects and unsupported media.
+ */
+async function resolveAudioUrl(sourceUrl: string): Promise<string> {
+  const value = sourceUrl.trim();
+
+  if (!value) {
+    throw new Error("This track does not have an audio URL.");
+  }
+
+  // Full URLs must be passed through unchanged.
+  if (/^https?:\/\//i.test(value)) {
+    return value;
+  }
+
+  if (/^(file|content|data):/i.test(value)) {
+    throw new Error(
+      "This audio source must be an HTTPS URL or a Supabase Storage path."
+    );
+  }
+
+  const normalizedPath = value
+    .replace(/^\/+/, "")
+    .replace(/\\/g, "/");
+
+  let bucket = AUDIO_STORAGE_BUCKET;
+  let filePath = normalizedPath;
+
+  // Accept paths in the form bucket-name/folder/file.mp3.
+  // When the first segment is the configured bucket, remove it.
+  if (normalizedPath.startsWith(`${bucket}/`)) {
+    filePath = normalizedPath.slice(bucket.length + 1);
+  } else if (normalizedPath.startsWith("storage/v1/object/")) {
+    throw new Error(
+      "Use the complete HTTPS Storage URL instead of a partial Storage API path."
+    );
+  } else if (
+    normalizedPath.includes("/") &&
+    !normalizedPath.startsWith(`${bucket}/`)
+  ) {
+    // For other bucket-prefixed paths, treat the first segment
+    // as the bucket name.
+    const separatorIndex = normalizedPath.indexOf("/");
+    bucket = normalizedPath.slice(0, separatorIndex);
+    filePath = normalizedPath.slice(separatorIndex + 1);
+  }
+
+  if (!bucket || !filePath) {
+    throw new Error(
+      "Invalid audio Storage path. Check the bucket name and file path."
+    );
+  }
+
+  // Prefer a signed URL. This supports private buckets when the
+  // authenticated user has permission to access the object.
+  const { data: signedData, error: signedError } = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(filePath, SIGNED_URL_LIFETIME_SECONDS);
+
+  if (!signedError && signedData?.signedUrl) {
+    return signedData.signedUrl;
+  }
+
+  // Public buckets can still work if signed URL creation is denied.
+  const { data: publicData } = supabase.storage
+    .from(bucket)
+    .getPublicUrl(filePath);
+
+  if (publicData?.publicUrl) {
+    return publicData.publicUrl;
+  }
+
+  throw new Error(
+    signedError?.message ||
+      "Could not generate an audio URL. Check your Storage bucket configuration."
+  );
+}
+
 export default function AudioPlayer({
   user,
   exercise,
@@ -72,67 +180,53 @@ export default function AudioPlayer({
 }: Props) {
   const insets = useSafeAreaInsets();
 
-  const soundRef = useRef<Sound | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const appStateRef = useRef(AppState.currentState);
   const mountedRef = useRef(true);
   const savingRef = useRef(false);
   const finishedRef = useRef(false);
+
   const sessionIdRef = useRef<string | null>(null);
   const sessionPromiseRef = useRef<Promise<string | null> | null>(null);
+
   const elapsedRef = useRef(0);
   const lastPositionRef = useRef(0);
+  const playbackErrorRef = useRef<string | null>(null);
+  const onCloseRef = useRef(onClose);
 
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
+  const [playableUrl, setPlayableUrl] = useState<string | null>(null);
 
   const current = tracks[index];
 
-  const stopTimer = useCallback(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-  }, []);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
-  const pauseAudio = useCallback(() => {
-    stopTimer();
-    soundRef.current?.pause();
-
-    if (mountedRef.current) {
-      setPlaying(false);
-    }
-  }, [stopTimer]);
-
-  const releaseSound = useCallback(() => {
-    stopTimer();
-
-    const sound = soundRef.current;
-    soundRef.current = null;
-
-    if (sound) {
-      sound.stop(() => {
-        sound.release();
-      });
-    }
-  }, [stopTimer]);
-
-  const formatTime = (value: number) => {
+  const formatTime = useCallback((value: number) => {
     const safeValue = Math.max(0, Math.floor(value));
     const mins = Math.floor(safeValue / 60);
     const secs = safeValue % 60;
 
     return `${mins}:${String(secs).padStart(2, "0")}`;
-  };
+  }, []);
 
-  // Create one session record for this listening session.
+  const pauseAudio = useCallback(() => {
+    if (mountedRef.current) {
+      setPlaying(false);
+    }
+  }, []);
+
+  // Create one listening session for this player instance.
   useEffect(() => {
     mountedRef.current = true;
+    let cancelled = false;
 
     sessionPromiseRef.current = (async () => {
       if (!user?.id) {
@@ -160,15 +254,20 @@ export default function AudioPlayer({
           .single();
 
         if (error) {
-          console.warn("[AudioPlayer] Session creation failed:", error.message);
+          console.warn(
+            "[AudioPlayer] Session creation failed:",
+            error.message
+          );
+
           return null;
         }
 
-        sessionIdRef.current = data.id;
-
-        if (mountedRef.current) {
-          setSessionReady(true);
+        if (cancelled) {
+          return data.id as string;
         }
+
+        sessionIdRef.current = data.id;
+        setSessionReady(true);
 
         return data.id as string;
       } catch (error) {
@@ -178,17 +277,98 @@ export default function AudioPlayer({
     })();
 
     return () => {
+      cancelled = true;
       mountedRef.current = false;
-      stopTimer();
-
-      const sound = soundRef.current;
-      soundRef.current = null;
-
-      if (sound) {
-        sound.stop(() => sound.release());
-      }
     };
-  }, [user?.id, exercise.id, exercise.category, exercise.title, tracks.length, stopTimer]);
+  }, [
+    user?.id,
+    exercise.id,
+    exercise.category,
+    exercise.title,
+    tracks.length,
+  ]);
+
+  // Resolve each track URL before asking the native player to load it.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function prepareTrack() {
+      if (!current) {
+        setLoading(false);
+        setPlaying(false);
+        setPlayableUrl(null);
+        return;
+      }
+
+      playbackErrorRef.current = null;
+      lastPositionRef.current = 0;
+
+      setPosition(0);
+      setDuration(current.duration_seconds ?? 0);
+      setPlayableUrl(null);
+      setPlaying(false);
+      setLoading(true);
+
+      try {
+        const url = await resolveAudioUrl(current.source_url);
+
+        if (cancelled || !mountedRef.current) {
+          return;
+        }
+
+        setPlayableUrl(url);
+        setPlaying(current.autoplay ?? true);
+      } catch (error) {
+        if (cancelled || !mountedRef.current) {
+          return;
+        }
+
+        setLoading(false);
+        setPlaying(false);
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Unable to resolve the audio URL.";
+
+        console.warn(
+          `[AudioPlayer] URL resolution failed for "${current.title}":`,
+          message
+        );
+
+        Alert.alert(
+          "Unable to prepare audio",
+          `${current.title}\n\n${message}`
+        );
+      }
+    }
+
+    void prepareTrack();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [current?.id, current?.source_url]);
+
+  // Pause audio when the app leaves the foreground.
+  useEffect(() => {
+    const subscription = AppState.addEventListener(
+      "change",
+      (nextState) => {
+        const wasActive = appStateRef.current === "active";
+        const goingInactive =
+          nextState === "inactive" || nextState === "background";
+
+        if (wasActive && goingInactive) {
+          pauseAudio();
+        }
+
+        appStateRef.current = nextState;
+      }
+    );
+
+    return () => subscription.remove();
+  }, [pauseAudio]);
 
   const finishSession = useCallback(
     async (completed: boolean) => {
@@ -206,30 +386,34 @@ export default function AudioPlayer({
 
       savingRef.current = true;
       setSaving(true);
-
       pauseAudio();
 
       try {
-        // Wait for session creation to finish before attempting an update.
-        const sessionId = sessionIdRef.current ??
+        const sessionId =
+          sessionIdRef.current ??
           (sessionPromiseRef.current
             ? await sessionPromiseRef.current
             : null);
 
         if (!sessionId) {
           throw new Error(
-            "Your listening session could not be created. Please check your connection and try again."
+            "Your listening session could not be created. Check your connection, database permissions and try again."
           );
         }
 
-        const elapsed = Math.max(0, Math.floor(elapsedRef.current));
+        const totalElapsed = Math.max(
+          0,
+          Math.floor(elapsedRef.current)
+        );
 
         const { error: sessionError } = await supabase
           .from("wellness_sessions")
           .update({
             completed,
-            duration_seconds: elapsed,
-            completed_at: completed ? new Date().toISOString() : null,
+            duration_seconds: totalElapsed,
+            completed_at: completed
+              ? new Date().toISOString()
+              : null,
             metadata: {
               source: "audio_player",
               exercise_title: exercise.title,
@@ -250,15 +434,16 @@ export default function AudioPlayer({
             .insert({
               user_id: user.id,
               activity_type: exercise.category || "Music",
-              duration_minutes: Math.max(1, Math.round(elapsed / 60)),
+              duration_minutes: Math.max(
+                1,
+                Math.round(totalElapsed / 60)
+              ),
               completed: true,
             });
 
           if (activityError) {
-            // The session itself has already been saved. Don't mark it
-            // as failed or retry it automatically, which could duplicate it.
             console.warn(
-              "[AudioPlayer] Daily activity logging failed:",
+              "[AudioPlayer] Activity logging failed:",
               activityError.message
             );
           }
@@ -267,7 +452,7 @@ export default function AudioPlayer({
         finishedRef.current = true;
 
         if (mountedRef.current) {
-          onClose(completed);
+          onCloseRef.current(completed);
         }
       } catch (error) {
         const message =
@@ -284,166 +469,27 @@ export default function AudioPlayer({
         }
       }
     },
-    [user?.id, exercise, tracks.length, current?.title, pauseAudio, onClose]
+    [
+      user?.id,
+      exercise,
+      tracks.length,
+      current?.title,
+      pauseAudio,
+    ]
   );
-
-  const playTrack = useCallback(
-    (sound: Sound) => {
-      if (savingRef.current || finishedRef.current) {
-        return;
-      }
-
-      stopTimer();
-
-      sound.play((success) => {
-        if (!mountedRef.current || finishedRef.current) {
-          return;
-        }
-
-        stopTimer();
-
-        if (!success) {
-          setPlaying(false);
-          return;
-        }
-
-        // A looping track should not advance automatically.
-        if (current?.loop) {
-          return;
-        }
-
-        if (index < tracks.length - 1) {
-          setIndex((previous) => previous + 1);
-        } else {
-          void finishSession(true);
-        }
-      });
-
-      setPlaying(true);
-
-      timerRef.current = setInterval(() => {
-        if (appStateRef.current !== "active") {
-          return;
-        }
-
-        sound.getCurrentTime((seconds) => {
-          if (!mountedRef.current) {
-            return;
-          }
-
-          const nextPosition = Math.max(0, seconds);
-          const previousPosition = lastPositionRef.current;
-
-          // Count forward playback only. This avoids counting a seek
-          // backwards as negative listening time.
-          if (nextPosition >= previousPosition) {
-            elapsedRef.current += nextPosition - previousPosition;
-          }
-
-          lastPositionRef.current = nextPosition;
-          setPosition(nextPosition);
-        });
-      }, 500);
-    },
-    [stopTimer, current?.loop, index, tracks.length, finishSession]
-  );
-
-  // Load a new track whenever the selected track changes.
-  useEffect(() => {
-    if (!current) {
-      setLoading(false);
-      return;
-    }
-
-    let cancelled = false;
-
-    stopTimer();
-
-    const oldSound = soundRef.current;
-    soundRef.current = null;
-
-    if (oldSound) {
-      oldSound.stop(() => oldSound.release());
-    }
-
-    setPlaying(false);
-    setPosition(0);
-    setDuration(0);
-    setLoading(true);
-    lastPositionRef.current = 0;
-
-    const sound = new Sound(current.source_url, "", (error) => {
-      if (cancelled) {
-        sound.release();
-        return;
-      }
-
-      if (error) {
-        setLoading(false);
-        setPlaying(false);
-
-        Alert.alert(
-          "Playback error",
-          `Couldn't load "${current.title}". Check the audio URL and your connection.`,
-          [{ text: "OK" }]
-        );
-        return;
-      }
-
-      soundRef.current = sound;
-      setDuration(sound.getDuration());
-      setLoading(false);
-
-      if (current.autoplay ?? true) {
-        playTrack(sound);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      stopTimer();
-
-      if (soundRef.current === sound) {
-        soundRef.current = null;
-      }
-
-      sound.stop(() => sound.release());
-    };
-  }, [current?.id, current?.source_url, stopTimer, playTrack]);
-
-  // Stop playback when the app enters the background.
-  useEffect(() => {
-    const subscription = AppState.addEventListener(
-      "change",
-      (nextState) => {
-        const wasActive = appStateRef.current === "active";
-        const goingInactive =
-          nextState === "inactive" || nextState === "background";
-
-        if (wasActive && goingInactive) {
-          pauseAudio();
-        }
-
-        appStateRef.current = nextState;
-      }
-    );
-
-    return () => subscription.remove();
-  }, [pauseAudio]);
 
   const togglePlay = useCallback(() => {
-    if (saving || loading || !soundRef.current || finishedRef.current) {
+    if (
+      saving ||
+      loading ||
+      !playableUrl ||
+      finishedRef.current
+    ) {
       return;
     }
 
-    const sound = soundRef.current;
-
-    if (playing) {
-      pauseAudio();
-    } else {
-      playTrack(sound);
-    }
-  }, [saving, loading, playing, pauseAudio, playTrack]);
+    setPlaying((previous) => !previous);
+  }, [saving, loading, playableUrl]);
 
   const changeTrack = useCallback(
     (nextIndex: number) => {
@@ -461,7 +507,123 @@ export default function AudioPlayer({
     [saving, tracks.length]
   );
 
-  const handleExit = () => {
+  const handleTrackEnd = useCallback(() => {
+    if (
+      !mountedRef.current ||
+      savingRef.current ||
+      finishedRef.current
+    ) {
+      return;
+    }
+
+    if (current?.loop) {
+      return;
+    }
+
+    if (index < tracks.length - 1) {
+      setIndex((previous) => previous + 1);
+    } else {
+      void finishSession(true);
+    }
+  }, [current?.loop, index, tracks.length, finishSession]);
+
+  const handlePlaybackError = useCallback(
+    (error: any) => {
+      if (!mountedRef.current || finishedRef.current) {
+        return;
+      }
+
+      setLoading(false);
+      setPlaying(false);
+
+      const errorKey = current?.id ?? "unknown";
+
+      if (playbackErrorRef.current === errorKey) {
+        return;
+      }
+
+      playbackErrorRef.current = errorKey;
+
+      // Avoid printing signed URL tokens to logs.
+      const nativeError = error?.error ?? error;
+      const errorCode =
+        nativeError?.errorCode ??
+        nativeError?.code ??
+        "unknown";
+
+      const errorMessage =
+        nativeError?.errorString ??
+        nativeError?.localizedDescription ??
+        nativeError?.message ??
+        "No native error message was provided.";
+
+      console.warn("[AudioPlayer] Native playback error:", {
+        trackId: current?.id,
+        title: current?.title,
+        errorCode,
+        errorMessage,
+      });
+
+      Alert.alert(
+        "Unable to play audio",
+        `Couldn't play "${current?.title ?? "this track"}".\n\nCheck that the file exists in Supabase Storage, the bucket and file permissions are correct, and the URL points to a supported audio file.\n\nError: ${String(errorCode)}`
+      );
+    },
+    [current?.id, current?.title]
+  );
+
+  const handleProgress = useCallback(
+    (data: any) => {
+      if (!mountedRef.current) {
+        return;
+      }
+
+      const nextPosition = Math.max(
+        0,
+        Number(data?.currentTime) || 0
+      );
+
+      const previousPosition = lastPositionRef.current;
+
+      if (playing && appStateRef.current === "active") {
+        // Count forward playback, including a track looping to zero.
+        const difference =
+          nextPosition >= previousPosition
+            ? nextPosition - previousPosition
+            : nextPosition;
+
+        if (difference > 0 && difference < 10) {
+          elapsedRef.current += difference;
+          setElapsed(Math.floor(elapsedRef.current));
+        }
+      }
+
+      lastPositionRef.current = nextPosition;
+      setPosition(nextPosition);
+    },
+    [playing]
+  );
+
+  const handleLoad = useCallback(
+    (data: any) => {
+      if (!mountedRef.current) {
+        return;
+      }
+
+      const loadedDuration = Number(data?.duration) || 0;
+
+      setDuration(
+        loadedDuration > 0
+          ? loadedDuration
+          : current?.duration_seconds ?? 0
+      );
+
+      setLoading(false);
+    },
+    [current?.duration_seconds]
+  );
+
+  const handleExit = useCallback(() => {
     Alert.alert(
       "End listening session?",
       "Your listening time will be saved as an incomplete session.",
@@ -479,7 +641,7 @@ export default function AudioPlayer({
         },
       ]
     );
-  };
+  }, [finishSession]);
 
   if (!current) {
     return (
@@ -493,10 +655,13 @@ export default function AudioPlayer({
         <View style={styles.emptyIcon}>
           <Music2 size={32} color="#247A4A" />
         </View>
+
         <Text style={styles.emptyTitle}>No tracks available</Text>
+
         <Text style={styles.emptyDescription}>
           There are no audio tracks available for this session yet.
         </Text>
+
         <TouchableOpacity
           style={styles.emptyButton}
           onPress={() => onClose(false)}
@@ -508,9 +673,10 @@ export default function AudioPlayer({
     );
   }
 
-  const progress = duration > 0
-    ? Math.min(100, Math.max(0, (position / duration) * 100))
-    : 0;
+  const progress =
+    duration > 0
+      ? Math.min(100, Math.max(0, (position / duration) * 100))
+      : 0;
 
   return (
     <View
@@ -519,6 +685,27 @@ export default function AudioPlayer({
         { paddingTop: Math.max(insets.top, 8) },
       ]}
     >
+      {playableUrl ? (
+        <Video
+          key={`${current.id}:${playableUrl}`}
+          source={{ uri: playableUrl }}
+          paused={!playing || saving}
+          repeat={!!current.loop}
+          playInBackground={false}
+          playWhenInactive={false}
+          ignoreSilentSwitch="ignore"
+          resizeMode="contain"
+          onLoad={handleLoad}
+          onProgress={handleProgress}
+          onEnd={handleTrackEnd}
+          onError={handlePlaybackError}
+          onLoadStart={() => setLoading(true)}
+          onBuffer={({ isBuffering }) => setLoading(isBuffering)}
+          progressUpdateInterval={500}
+          style={styles.hiddenPlayer}
+        />
+      ) : null}
+
       <StatusBar
         barStyle="dark-content"
         backgroundColor="#F4F8F5"
@@ -540,7 +727,9 @@ export default function AudioPlayer({
           <Text style={styles.headerTitle} numberOfLines={1}>
             {exercise.title}
           </Text>
-          <Text style={styles.headerSubtitle}>A MOMENT FOR YOU</Text>
+          <Text style={styles.headerSubtitle}>
+            A MOMENT FOR YOU
+          </Text>
         </View>
 
         <View style={styles.trackCounter}>
@@ -563,12 +752,14 @@ export default function AudioPlayer({
           <View style={styles.introIcon}>
             <Sparkles size={18} color="#247A4A" />
           </View>
+
           <View style={styles.introText}>
             <Text style={styles.introTitle}>Find your calm</Text>
             <Text style={styles.introSubtitle}>
               Unwind, focus, and reconnect with yourself.
             </Text>
           </View>
+
           <Leaf size={24} color="#8AB99A" />
         </View>
 
@@ -596,10 +787,15 @@ export default function AudioPlayer({
               >
                 <View style={styles.discRing}>
                   <View style={styles.discInner}>
-                    <Headphones size={42} color="#FFFFFF" strokeWidth={1.5} />
+                    <Headphones
+                      size={42}
+                      color="#FFFFFF"
+                      strokeWidth={1.5}
+                    />
                   </View>
                 </View>
               </LinearGradient>
+
               <View style={styles.artworkSparkle}>
                 <Sparkles size={22} color="#247A4A" />
               </View>
@@ -608,7 +804,9 @@ export default function AudioPlayer({
 
           <View style={styles.artworkLabel}>
             <Music2 size={12} color="#FFFFFF" />
-            <Text style={styles.artworkLabelText}>WELLNESS AUDIO</Text>
+            <Text style={styles.artworkLabelText}>
+              WELLNESS AUDIO
+            </Text>
           </View>
         </LinearGradient>
 
@@ -657,7 +855,9 @@ export default function AudioPlayer({
           </View>
 
           <View style={styles.timeRow}>
-            <Text style={styles.timeText}>{formatTime(position)}</Text>
+            <Text style={styles.timeText}>
+              {formatTime(position)}
+            </Text>
             <Text style={styles.timeText}>
               {formatTime(duration || current.duration_seconds || 0)}
             </Text>
@@ -682,10 +882,11 @@ export default function AudioPlayer({
 
           <TouchableOpacity
             onPress={togglePlay}
-            disabled={loading || saving}
+            disabled={loading || saving || !playableUrl}
             style={[
               styles.playButton,
-              (loading || saving) && styles.controlDisabled,
+              (loading || saving || !playableUrl) &&
+                styles.controlDisabled,
             ]}
             activeOpacity={0.85}
             accessibilityRole="button"
@@ -736,14 +937,16 @@ export default function AudioPlayer({
           </View>
 
           <View style={styles.sessionText}>
-            <Text style={styles.sessionTitle}>Your listening session</Text>
+            <Text style={styles.sessionTitle}>
+              Your listening session
+            </Text>
             <Text style={styles.sessionSubtitle}>
               Time spent listening to your audio
             </Text>
           </View>
 
           <Text style={styles.sessionTime}>
-            {formatTime(elapsedRef.current)}
+            {formatTime(elapsed)}
           </Text>
         </View>
 
@@ -751,7 +954,7 @@ export default function AudioPlayer({
         <TouchableOpacity
           style={[
             styles.finishButton,
-            saving && styles.controlDisabled,
+            (saving || !sessionReady) && styles.controlDisabled,
           ]}
           onPress={() => void finishSession(true)}
           disabled={saving || !sessionReady}
@@ -790,12 +993,17 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#F4F8F5",
   },
-
+  hiddenPlayer: {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    opacity: 0,
+  },
   emptyRoot: {
     alignItems: "center",
+    justifyContent: "center",
     paddingHorizontal: 30,
   },
-
   emptyIcon: {
     width: 76,
     height: 76,
@@ -805,13 +1013,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginBottom: 20,
   },
-
   emptyTitle: {
     fontSize: 21,
     fontWeight: "800",
     color: "#293D31",
   },
-
   emptyDescription: {
     fontSize: 13,
     lineHeight: 20,
@@ -819,7 +1025,6 @@ const styles = StyleSheet.create({
     color: "#829087",
     marginTop: 9,
   },
-
   emptyButton: {
     marginTop: 23,
     paddingHorizontal: 28,
@@ -827,13 +1032,11 @@ const styles = StyleSheet.create({
     backgroundColor: "#247A4A",
     borderRadius: 15,
   },
-
   emptyButtonText: {
     color: "#FFFFFF",
     fontSize: 13,
     fontWeight: "800",
   },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -841,7 +1044,6 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     paddingBottom: 17,
   },
-
   backButton: {
     width: 43,
     height: 43,
@@ -852,18 +1054,15 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   headerText: {
     flex: 1,
     marginHorizontal: 12,
   },
-
   headerTitle: {
     fontSize: 15,
     fontWeight: "800",
     color: "#293D31",
   },
-
   headerSubtitle: {
     fontSize: 9,
     fontWeight: "800",
@@ -871,7 +1070,6 @@ const styles = StyleSheet.create({
     color: "#7D9885",
     marginTop: 4,
   },
-
   trackCounter: {
     flexDirection: "row",
     alignItems: "center",
@@ -881,23 +1079,19 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 13,
   },
-
   counterText: {
     fontSize: 11,
     fontWeight: "800",
     color: "#247A4A",
   },
-
   content: {
     paddingHorizontal: 20,
   },
-
   introRow: {
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 22,
   },
-
   introIcon: {
     width: 41,
     height: 41,
@@ -907,23 +1101,19 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginRight: 11,
   },
-
   introText: {
     flex: 1,
   },
-
   introTitle: {
     fontSize: 14,
     fontWeight: "800",
     color: "#2B4936",
   },
-
   introSubtitle: {
     fontSize: 11,
     color: "#87958B",
     marginTop: 4,
   },
-
   artworkCard: {
     width: "100%",
     aspectRatio: 1.12,
@@ -935,7 +1125,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#D1E7D8",
   },
-
   artDecorationOne: {
     position: "absolute",
     width: 230,
@@ -945,7 +1134,6 @@ const styles = StyleSheet.create({
     top: -100,
     right: -70,
   },
-
   artDecorationTwo: {
     position: "absolute",
     width: 180,
@@ -955,20 +1143,17 @@ const styles = StyleSheet.create({
     bottom: -80,
     left: -65,
   },
-
   artworkImage: {
     width: "100%",
     height: "100%",
     position: "absolute",
   },
-
   artworkFallback: {
     width: 210,
     height: 210,
     alignItems: "center",
     justifyContent: "center",
   },
-
   artworkDisc: {
     width: 184,
     height: 184,
@@ -981,7 +1166,6 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2,
     shadowRadius: 15,
   },
-
   discRing: {
     width: 144,
     height: 144,
@@ -991,7 +1175,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   discInner: {
     width: 94,
     height: 94,
@@ -1000,7 +1183,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   artworkSparkle: {
     position: "absolute",
     right: 12,
@@ -1012,7 +1194,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   artworkLabel: {
     position: "absolute",
     left: 15,
@@ -1025,19 +1206,16 @@ const styles = StyleSheet.create({
     borderRadius: 13,
     backgroundColor: "rgba(25,75,47,0.85)",
   },
-
   artworkLabelText: {
     fontSize: 9,
     fontWeight: "800",
     letterSpacing: 1.1,
     color: "#FFFFFF",
   },
-
   trackDetails: {
     alignItems: "center",
     marginBottom: 25,
   },
-
   trackTitle: {
     fontSize: 22,
     lineHeight: 29,
@@ -1046,13 +1224,11 @@ const styles = StyleSheet.create({
     color: "#263D2F",
     textAlign: "center",
   },
-
   trackArtist: {
     fontSize: 13,
     color: "#829087",
     marginTop: 7,
   },
-
   trackTags: {
     flexDirection: "row",
     alignItems: "center",
@@ -1061,7 +1237,6 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 13,
   },
-
   tag: {
     flexDirection: "row",
     alignItems: "center",
@@ -1071,17 +1246,14 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
     borderRadius: 12,
   },
-
   tagText: {
     fontSize: 10,
     fontWeight: "700",
     color: "#477857",
   },
-
   seekSection: {
     marginBottom: 20,
   },
-
   seekTrack: {
     height: 6,
     borderRadius: 5,
@@ -1089,13 +1261,11 @@ const styles = StyleSheet.create({
     overflow: "visible",
     position: "relative",
   },
-
   seekFill: {
     height: 6,
     borderRadius: 5,
     backgroundColor: "#247A4A",
   },
-
   seekThumb: {
     position: "absolute",
     width: 13,
@@ -1107,20 +1277,17 @@ const styles = StyleSheet.create({
     top: -3.5,
     marginLeft: -6.5,
   },
-
   timeRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     marginTop: 10,
   },
-
   timeText: {
     fontSize: 11,
     fontWeight: "600",
     color: "#849187",
     fontVariant: ["tabular-nums"],
   },
-
   controls: {
     flexDirection: "row",
     alignItems: "center",
@@ -1128,7 +1295,6 @@ const styles = StyleSheet.create({
     gap: 31,
     marginTop: 7,
   },
-
   sideControl: {
     width: 53,
     height: 53,
@@ -1139,7 +1305,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   playButton: {
     width: 80,
     height: 80,
@@ -1151,18 +1316,15 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2,
     shadowRadius: 10,
   },
-
   playButtonGradient: {
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: 29,
   },
-
   controlDisabled: {
     opacity: 0.45,
   },
-
   playbackHint: {
     textAlign: "center",
     fontSize: 11,
@@ -1170,7 +1332,6 @@ const styles = StyleSheet.create({
     marginTop: 15,
     marginBottom: 25,
   },
-
   sessionCard: {
     flexDirection: "row",
     alignItems: "center",
@@ -1181,7 +1342,6 @@ const styles = StyleSheet.create({
     padding: 15,
     marginBottom: 17,
   },
-
   sessionIcon: {
     width: 42,
     height: 42,
@@ -1191,30 +1351,25 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginRight: 12,
   },
-
   sessionText: {
     flex: 1,
   },
-
   sessionTitle: {
     fontSize: 12,
     fontWeight: "800",
     color: "#304438",
   },
-
   sessionSubtitle: {
     fontSize: 10,
     color: "#87948B",
     marginTop: 5,
   },
-
   sessionTime: {
     fontSize: 15,
     fontWeight: "800",
     color: "#247A4A",
     fontVariant: ["tabular-nums"],
   },
-
   finishButton: {
     minHeight: 56,
     flexDirection: "row",
@@ -1230,13 +1385,11 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.14,
     shadowRadius: 8,
   },
-
   finishButtonText: {
     fontSize: 13,
     fontWeight: "800",
     color: "#FFFFFF",
   },
-
   privacyNote: {
     flexDirection: "row",
     alignItems: "center",
@@ -1244,7 +1397,6 @@ const styles = StyleSheet.create({
     gap: 7,
     marginTop: 19,
   },
-
   privacyText: {
     fontSize: 10,
     color: "#84968A",

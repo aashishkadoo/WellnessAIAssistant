@@ -1,20 +1,28 @@
 // src/screens/ProgressScreen.tsx
 
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
- // src/screens/ProgressScreen.tsx
-import React from "react";
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
   StatusBar,
-  Dimensions,
+  useWindowDimensions,
+  ActivityIndicator,
+  RefreshControl,
+  Pressable,
 } from "react-native";
+
 import LinearGradient from "react-native-linear-gradient";
+
 import {
   Activity,
-  ArrowUpRight,
   Award,
   Brain,
   Check,
@@ -22,20 +30,41 @@ import {
   Flame,
   Heart,
   Leaf,
-  Moon,
   Sparkles,
-  Target,
   TrendingUp,
   Wind,
-  Zap,
 } from "lucide-react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import {
+  useScreenLayout,
+} from "../context/ScreenLayoutContext";
+
+import {
+  fetchWellnessMetrics,
+  type WellnessMetrics,
+} from "../services/wellnessMetricsService";
+
+// ============================================================================
+// TYPES
+// ============================================================================
 
 type Props = {
   user: any;
 };
 
-const SCREEN_WIDTH = Dimensions.get("window").width;
+type StatCardProps = {
+  icon: React.ReactNode;
+  value: string;
+  label: string;
+  caption: string;
+  accent: string;
+  background: string;
+  width: number;
+};
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
 const COLORS = {
   background: "#F3F8F4",
@@ -52,14 +81,9 @@ const COLORS = {
   blue: "#6D9FEA",
 };
 
-type StatCardProps = {
-  icon: React.ReactNode;
-  value: string;
-  label: string;
-  caption: string;
-  accent: string;
-  background: string;
-};
+// ============================================================================
+// STAT CARD
+// ============================================================================
 
 function StatCard({
   icon,
@@ -68,9 +92,10 @@ function StatCard({
   caption,
   accent,
   background,
+  width,
 }: StatCardProps) {
   return (
-    <View style={styles.statCard}>
+    <View style={[styles.statCard, { width }]}>
       <View
         style={[
           styles.statIconContainer,
@@ -81,7 +106,9 @@ function StatCard({
       </View>
 
       <Text style={styles.statValue}>{value}</Text>
+
       <Text style={styles.statLabel}>{label}</Text>
+
       <Text style={styles.statCaption}>{caption}</Text>
 
       <View
@@ -94,202 +121,530 @@ function StatCard({
   );
 }
 
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+function formatSessionDuration(seconds: number): string {
+  const safeSeconds = Math.max(
+    0,
+    Math.floor(seconds || 0),
+  );
+
+  if (safeSeconds < 60) {
+    return `${safeSeconds} sec`;
+  }
+
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+
+  if (remainingSeconds === 0) {
+    return `${minutes} min`;
+  }
+
+  return `${minutes} min ${remainingSeconds} sec`;
+}
+
+function formatSessionDate(value: string): string {
+  if (!value) {
+    return "";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const today = new Date();
+  const yesterday = new Date();
+
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const dateKey = (d: Date) =>
+    `${d.getFullYear()}-${String(
+      d.getMonth() + 1,
+    ).padStart(2, "0")}-${String(
+      d.getDate(),
+    ).padStart(2, "0")}`;
+
+  if (dateKey(date) === dateKey(today)) {
+    return "Today";
+  }
+
+  if (dateKey(date) === dateKey(yesterday)) {
+    return "Yesterday";
+  }
+
+  return date.toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "short",
+  });
+}
+
+// ============================================================================
+// MAIN SCREEN
+// ============================================================================
+
 export default function ProgressScreen({ user }: Props) {
-  const insets = useSafeAreaInsets();
+  const layout = useScreenLayout();
 
-  // Demo values retained from the original screen.
-  // Replace these with values from your wellness metrics service.
-  const stats = {
-    exercises: 12,
-    breathingSessions: 8,
-    minutes: 96,
-    wellnessScore: 82,
-    streak: 7,
-  };
+  const { width: screenWidth } = useWindowDimensions();
 
-  const weeklyActivity = [
-    { day: "M", active: true, height: 42 },
-    { day: "T", active: true, height: 58 },
-    { day: "W", active: true, height: 48 },
-    { day: "T", active: false, height: 18 },
-    { day: "F", active: true, height: 64 },
-    { day: "S", active: true, height: 52 },
-    { day: "S", active: false, height: 12 },
-  ];
+  const userId = user?.id ?? user?.user?.id ?? null;
+
+  // --------------------------------------------------------------------------
+  // RESPONSIVE LAYOUT
+  // --------------------------------------------------------------------------
+
+  const horizontalPadding = layout.horizontalPadding;
+
+  const contentWidth = Math.max(
+    0,
+    screenWidth - horizontalPadding * 2,
+  );
+
+  const cardGap = 12;
+
+  const statCardWidth = Math.max(
+    0,
+    (contentWidth - cardGap) / 2,
+  );
+
+  // --------------------------------------------------------------------------
+  // STATE
+  // --------------------------------------------------------------------------
+
+  const [metrics, setMetrics] =
+    useState<WellnessMetrics | null>(null);
+
+  const [loading, setLoading] = useState(true);
+
+  const [refreshing, setRefreshing] = useState(false);
+
+  const [error, setError] = useState<string | null>(null);
+
+  // --------------------------------------------------------------------------
+  // LOAD REAL METRICS
+  // --------------------------------------------------------------------------
+
+  const loadProgress = useCallback(
+    async (isRefresh = false) => {
+      if (!userId) {
+        setError(
+          "Your account could not be identified. Please sign in again.",
+        );
+
+        setLoading(false);
+        setRefreshing(false);
+
+        return;
+      }
+
+      if (isRefresh) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
+      }
+
+      setError(null);
+
+      try {
+        const result = await fetchWellnessMetrics(userId);
+
+        setMetrics(result);
+      } catch (err: any) {
+        console.error(
+          "[ProgressScreen] Failed to load metrics:",
+          err,
+        );
+
+        setError(
+          "We couldn't load your progress. Please check your connection or try again.",
+        );
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [userId],
+  );
+
+  useEffect(() => {
+    void loadProgress();
+  }, [loadProgress]);
+
+  const onRefresh = useCallback(() => {
+    void loadProgress(true);
+  }, [loadProgress]);
+
+  // --------------------------------------------------------------------------
+  // DERIVED STATISTICS
+  // --------------------------------------------------------------------------
+
+  const stats = metrics?.weeklyStats;
+
+  const dailyActivity = metrics?.dailyActivity ?? [];
+
+  const activeDays = useMemo(
+    () =>
+      dailyActivity.filter(
+        (day) => day.sessionsCount > 0,
+      ).length,
+    [dailyActivity],
+  );
+
+  const maxMinutes = useMemo(
+    () =>
+      Math.max(
+        1,
+        ...dailyActivity.map(
+          (day) => day.totalMinutes,
+        ),
+      ),
+    [dailyActivity],
+  );
+
+  // --------------------------------------------------------------------------
+  // STATUS BAR
+  // --------------------------------------------------------------------------
+
+  const statusBar = (
+    <StatusBar
+      barStyle="dark-content"
+      backgroundColor={COLORS.background}
+      translucent={false}
+    />
+  );
+
+  // --------------------------------------------------------------------------
+  // LOADING SCREEN
+  // --------------------------------------------------------------------------
+
+  if (loading && !metrics) {
+    return (
+      <View style={styles.stateContainer}>
+        {statusBar}
+
+        <ActivityIndicator
+          size="large"
+          color={COLORS.primary}
+        />
+
+        <Text style={styles.stateTitle}>
+          Loading your progress
+        </Text>
+
+        <Text style={styles.stateDescription}>
+          Gathering your latest wellness activity...
+        </Text>
+      </View>
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // ERROR SCREEN
+  // --------------------------------------------------------------------------
+
+  if (error && !metrics) {
+    return (
+      <View style={styles.stateContainer}>
+        {statusBar}
+
+        <View style={styles.errorIcon}>
+          <Activity
+            size={30}
+            color={COLORS.primary}
+          />
+        </View>
+
+        <Text style={styles.stateTitle}>
+          Unable to load progress
+        </Text>
+
+        <Text style={styles.stateDescription}>
+          {error}
+        </Text>
+
+        <Pressable
+          onPress={() => void loadProgress()}
+          style={styles.retryButton}
+        >
+          <Text style={styles.retryButtonText}>
+            Try again
+          </Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // MAIN UI
+  // --------------------------------------------------------------------------
 
   return (
     <View style={styles.container}>
-      <StatusBar
-        barStyle="dark-content"
-        backgroundColor={COLORS.background}
-      />
+      {statusBar}
 
       <ScrollView
+        style={styles.scrollView}
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={COLORS.primary}
+            colors={[COLORS.primary]}
+          />
+        }
         contentContainerStyle={[
           styles.content,
           {
-            paddingTop: Math.max(insets.top, 12) + 10,
-            paddingBottom: Math.max(insets.bottom, 12) + 105,
+            paddingTop: layout.topPadding,
+            paddingHorizontal: horizontalPadding,
+            paddingBottom: layout.bottomPadding,
           },
         ]}
       >
         {/* HEADER */}
+
         <View style={styles.header}>
           <View style={styles.headerText}>
             <View style={styles.eyebrow}>
-              <Sparkles size={14} color={COLORS.primary} />
+              <Sparkles
+                size={14}
+                color={COLORS.primary}
+              />
+
               <Text style={styles.eyebrowText}>
                 YOUR WELLNESS JOURNEY
               </Text>
             </View>
 
-            <Text style={styles.title}>Your progress</Text>
+            <Text style={styles.title}>
+              Your progress
+            </Text>
+
             <Text style={styles.subtitle}>
               Every small step is a step forward.
             </Text>
           </View>
 
           <LinearGradient
-            colors={["#D9F4E3", "#B7E7C9", "#EAF8EF"]}
+            colors={[
+              "#D9F4E3",
+              "#B7E7C9",
+              "#EAF8EF",
+            ]}
             start={{ x: 0, y: 0 }}
             end={{ x: 1, y: 1 }}
             style={styles.headerBadge}
           >
-            <Activity size={25} color={COLORS.primary} />
+            <Activity
+              size={25}
+              color={COLORS.primary}
+            />
           </LinearGradient>
         </View>
 
         {/* STREAK HERO */}
+
         <LinearGradient
-          colors={["#226D43", "#2D8956", "#51A977"]}
+          colors={[
+            "#226D43",
+            "#2D8956",
+            "#51A977",
+          ]}
           start={{ x: 0, y: 0 }}
           end={{ x: 1, y: 1 }}
           style={styles.streakCard}
         >
           <View style={styles.streakGlowOne} />
+
           <View style={styles.streakGlowTwo} />
 
           <View style={styles.streakTopRow}>
             <View style={styles.streakPill}>
-              <Flame size={14} color="#FFE0A4" />
+              <Flame
+                size={14}
+                color="#FFE0A4"
+              />
+
               <Text style={styles.streakPillText}>
                 CURRENT STREAK
               </Text>
             </View>
 
             <View style={styles.streakAward}>
-              <Award size={22} color="#FFE3A7" />
+              <Award
+                size={22}
+                color="#FFE3A7"
+              />
             </View>
           </View>
 
           <View style={styles.streakMain}>
             <View style={styles.streakNumberWrap}>
               <Text style={styles.streakNumber}>
-                {stats.streak}
+                {stats?.streakDays ?? 0}
               </Text>
-              <Text style={styles.streakDays}>days</Text>
+
+              <Text style={styles.streakDays}>
+                {(stats?.streakDays ?? 0) === 1
+                  ? "day"
+                  : "days"}
+              </Text>
             </View>
 
             <View style={styles.streakMessage}>
               <Text style={styles.streakHeadline}>
-                You're building a habit!
+                {(stats?.streakDays ?? 0) > 0
+                  ? "You're building a habit!"
+                  : "Your journey starts today"}
               </Text>
+
               <Text style={styles.streakDescription}>
-                Keep showing up for yourself. Consistency matters
-                more than perfection.
+                {(stats?.streakDays ?? 0) > 0
+                  ? "Keep showing up for yourself. Consistency matters more than perfection."
+                  : "Complete a wellness session today to start building your streak."}
               </Text>
             </View>
           </View>
 
           <View style={styles.streakFooter}>
             <View style={styles.streakFooterIcon}>
-              <Check size={14} color="#FFFFFF" />
+              <Check
+                size={14}
+                color="#FFFFFF"
+              />
             </View>
+
             <Text style={styles.streakFooterText}>
               One day at a time
             </Text>
 
             <View style={styles.streakFooterSpacer} />
 
-            <Leaf size={17} color="#C9F1D7" />
+            <Leaf
+              size={17}
+              color="#C9F1D7"
+            />
           </View>
         </LinearGradient>
 
-        {/* STATISTICS */}
+        {/* WELLNESS SNAPSHOT */}
+
         <View style={styles.sectionHeader}>
-          <View>
+          <View style={styles.sectionHeaderText}>
             <Text style={styles.sectionTitle}>
               Your wellness snapshot
             </Text>
+
             <Text style={styles.sectionSubtitle}>
-              A little progress adds up.
+              Your actual recorded activity over the last 7 days.
             </Text>
           </View>
 
           <View style={styles.sectionIcon}>
-            <TrendingUp size={19} color={COLORS.primary} />
+            <TrendingUp
+              size={19}
+              color={COLORS.primary}
+            />
           </View>
         </View>
 
+        {/* STATISTICS */}
+
         <View style={styles.statsGrid}>
           <StatCard
-            icon={<Activity size={22} color={COLORS.primary} />}
-            value={String(stats.exercises)}
+            icon={
+              <Activity
+                size={22}
+                color={COLORS.primary}
+              />
+            }
+            value={String(stats?.sessionsCount ?? 0)}
             label="Exercises"
-            caption="Sessions completed"
+            caption="Completed sessions"
             accent={COLORS.primary}
             background="#E4F5E9"
+            width={statCardWidth}
           />
 
           <StatCard
-            icon={<Wind size={22} color={COLORS.blue} />}
-            value={String(stats.breathingSessions)}
+            icon={
+              <Wind
+                size={22}
+                color={COLORS.blue}
+              />
+            }
+            value={String(stats?.breathingSessions ?? 0)}
             label="Breathing"
-            caption="Mindful sessions"
+            caption="Completed breathing sessions"
             accent={COLORS.blue}
             background="#EAF1FF"
+            width={statCardWidth}
           />
 
           <StatCard
-            icon={<Clock3 size={22} color={COLORS.orange} />}
-            value={String(stats.minutes)}
+            icon={
+              <Clock3
+                size={22}
+                color={COLORS.orange}
+              />
+            }
+            value={String(stats?.totalMinutes ?? 0)}
             label="Minutes"
-            caption="Time for yourself"
+            caption="Recorded session duration"
             accent={COLORS.orange}
             background="#FFF1E0"
+            width={statCardWidth}
           />
 
           <StatCard
-            icon={<Heart size={22} color={COLORS.purple} />}
-            value={`${stats.wellnessScore}%`}
-            label="Wellness score"
-            caption="Personal indicator"
+            icon={
+              <Heart
+                size={22}
+                color={COLORS.purple}
+              />
+            }
+            value={`${stats?.completionRate ?? 0}%`}
+            label="Completion rate"
+            caption="Completed / started sessions"
             accent={COLORS.purple}
             background="#F0ECFF"
+            width={statCardWidth}
           />
         </View>
 
         {/* WEEKLY ACTIVITY */}
+
         <View style={styles.sectionHeader}>
-          <View>
+          <View style={styles.sectionHeaderText}>
             <Text style={styles.sectionTitle}>
               Weekly activity
             </Text>
+
             <Text style={styles.sectionSubtitle}>
-              Your movement through the week
+              Your recorded sessions from the last seven days.
             </Text>
           </View>
 
           <View style={styles.weekBadge}>
-            <Text style={styles.weekBadgeText}>7 DAYS</Text>
+            <Text style={styles.weekBadgeText}>
+              7 DAYS
+            </Text>
           </View>
         </View>
 
         <View style={styles.weekCard}>
           <View style={styles.weekSummary}>
             <View>
-              <Text style={styles.weekSummaryNumber}>5</Text>
+              <Text style={styles.weekSummaryNumber}>
+                {activeDays}
+              </Text>
+
               <Text style={styles.weekSummaryLabel}>
                 Active days
               </Text>
@@ -299,73 +654,200 @@ export default function ProgressScreen({ user }: Props) {
 
             <View style={styles.weekSummaryRight}>
               <View style={styles.weekTrend}>
-                <TrendingUp size={14} color={COLORS.primary} />
+                <TrendingUp
+                  size={14}
+                  color={COLORS.primary}
+                />
+
                 <Text style={styles.weekTrendText}>
-                  Keep it up
+                  {activeDays === 0
+                    ? "Ready when you are"
+                    : `${activeDays} of 7 days active`}
                 </Text>
               </View>
+
               <Text style={styles.weekSummaryHint}>
-                Every session counts
+                Based on completed sessions
               </Text>
             </View>
           </View>
 
           <View style={styles.chart}>
-            {weeklyActivity.map((item, index) => (
-              <View key={`${item.day}-${index}`} style={styles.chartColumn}>
-                <View style={styles.barTrack}>
-                  <LinearGradient
-                    colors={
-                      item.active
-                        ? ["#75D99B", "#247A4A"]
-                        : ["#E9F0EB", "#DDE8E0"]
-                    }
-                    start={{ x: 0, y: 0 }}
-                    end={{ x: 0, y: 1 }}
-                    style={[
-                      styles.bar,
-                      { height: item.height },
-                    ]}
-                  />
-                  {item.active && (
-                    <View style={styles.barHighlight} />
-                  )}
-                </View>
+            {dailyActivity.map((item) => {
+              const active = item.sessionsCount > 0;
 
+              const barHeight = active
+                ? Math.max(
+                    8,
+                    (item.totalMinutes / maxMinutes) * 70,
+                  )
+                : 5;
+
+              return (
                 <View
-                  style={[
-                    styles.dayDot,
-                    item.active && styles.dayDotActive,
-                  ]}
+                  key={item.date}
+                  style={styles.chartColumn}
                 >
-                  {item.active ? (
-                    <Check size={10} color="#FFFFFF" />
-                  ) : null}
-                </View>
+                  <View style={styles.barTrack}>
+                    <LinearGradient
+                      colors={
+                        active
+                          ? ["#75D99B", "#247A4A"]
+                          : ["#E9F0EB", "#DDE8E0"]
+                      }
+                      start={{ x: 0, y: 0 }}
+                      end={{ x: 0, y: 1 }}
+                      style={[
+                        styles.bar,
+                        { height: barHeight },
+                      ]}
+                    />
 
-                <Text
-                  style={[
-                    styles.chartDay,
-                    item.active && styles.chartDayActive,
-                  ]}
-                >
-                  {item.day}
-                </Text>
-              </View>
-            ))}
+                    {active && (
+                      <View style={styles.barHighlight} />
+                    )}
+                  </View>
+
+                  <View
+                    style={[
+                      styles.dayDot,
+                      active && styles.dayDotActive,
+                    ]}
+                  >
+                    {active && (
+                      <Check
+                        size={10}
+                        color="#FFFFFF"
+                      />
+                    )}
+                  </View>
+
+                  <Text
+                    style={[
+                      styles.chartDay,
+                      active && styles.chartDayActive,
+                    ]}
+                  >
+                    {item.day.substring(0, 1)}
+                  </Text>
+                </View>
+              );
+            })}
           </View>
 
           <View style={styles.chartLegend}>
             <View style={styles.legendDot} />
+
             <Text style={styles.legendText}>
-              Days with activity
+              Completed sessions
             </Text>
+
             <View style={styles.legendSpacer} />
-            <Text style={styles.legendText}>Mon – Sun</Text>
+
+            <Text style={styles.legendText}>
+              Bar height = minutes
+            </Text>
+          </View>
+
+          {activeDays === 0 && (
+            <Text style={styles.emptyChartText}>
+              No completed sessions recorded this week yet.
+            </Text>
+          )}
+        </View>
+
+        {/* RECENT SESSIONS */}
+
+        <View style={styles.sectionHeader}>
+          <View>
+            <Text style={styles.sectionTitle}>
+              Recent sessions
+            </Text>
+
+            <Text style={styles.sectionSubtitle}>
+              Your latest recorded wellness activities.
+            </Text>
           </View>
         </View>
 
+        <View style={styles.recentCard}>
+          {metrics?.recentSessions &&
+          metrics.recentSessions.length > 0 ? (
+            metrics.recentSessions.map((session, index) => (
+              <View key={session.id}>
+                <View style={styles.sessionRow}>
+                  <View style={styles.sessionIcon}>
+                    <Text style={styles.sessionEmoji}>
+                      {session.icon || "🧘"}
+                    </Text>
+                  </View>
+
+                  <View style={styles.sessionDetails}>
+                    <Text
+                      style={styles.sessionTitle}
+                      numberOfLines={1}
+                    >
+                      {session.title}
+                    </Text>
+
+                    <Text style={styles.sessionSubtitle}>
+                      {formatSessionDate(session.started_at)}
+                      {"  ·  "}
+                      {formatSessionDuration(
+                        session.duration_seconds,
+                      )}
+                    </Text>
+                  </View>
+
+                  <View
+                    style={[
+                      styles.sessionStatus,
+                      session.completed
+                        ? styles.sessionStatusComplete
+                        : styles.sessionStatusIncomplete,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.sessionStatusText,
+                        session.completed
+                          ? styles.sessionStatusTextComplete
+                          : styles.sessionStatusTextIncomplete,
+                      ]}
+                    >
+                      {session.completed
+                        ? "Done"
+                        : "Incomplete"}
+                    </Text>
+                  </View>
+                </View>
+
+                {index <
+                  metrics.recentSessions.length - 1 && (
+                  <View style={styles.sessionDivider} />
+                )}
+              </View>
+            ))
+          ) : (
+            <View style={styles.emptySessions}>
+              <Activity
+                size={25}
+                color={COLORS.muted}
+              />
+
+              <Text style={styles.emptySessionsTitle}>
+                No sessions yet
+              </Text>
+
+              <Text style={styles.emptySessionsText}>
+                Your completed wellness sessions will appear here.
+              </Text>
+            </View>
+          )}
+        </View>
+
         {/* WELLNESS INSIGHT */}
+
         <LinearGradient
           colors={["#F0FAF3", "#E1F4E8"]}
           start={{ x: 0, y: 0 }}
@@ -373,7 +855,10 @@ export default function ProgressScreen({ user }: Props) {
           style={styles.insightCard}
         >
           <View style={styles.insightIcon}>
-            <Brain size={24} color={COLORS.primary} />
+            <Brain
+              size={24}
+              color={COLORS.primary}
+            />
           </View>
 
           <View style={styles.insightContent}>
@@ -381,7 +866,11 @@ export default function ProgressScreen({ user }: Props) {
               <Text style={styles.insightTitle}>
                 A gentle reminder
               </Text>
-              <Sparkles size={15} color="#67A97F" />
+
+              <Sparkles
+                size={15}
+                color="#67A97F"
+              />
             </View>
 
             <Text style={styles.insightText}>
@@ -391,59 +880,6 @@ export default function ProgressScreen({ user }: Props) {
           </View>
         </LinearGradient>
 
-        {/* DAILY INTENTION */}
-        <View style={styles.intentionCard}>
-          <View style={styles.intentionTop}>
-            <View style={styles.intentionIcon}>
-              <Target size={21} color={COLORS.primary} />
-            </View>
-
-            <View style={styles.intentionHeading}>
-              <Text style={styles.intentionTitle}>
-                Your next small step
-              </Text>
-              <Text style={styles.intentionSubtitle}>
-                Make space for yourself today.
-              </Text>
-            </View>
-
-            <ArrowUpRight
-              size={20}
-              color={COLORS.secondary}
-            />
-          </View>
-
-          <View style={styles.intentionChips}>
-            <View style={styles.intentionChip}>
-              <Wind size={14} color={COLORS.primary} />
-              <Text style={styles.intentionChipText}>
-                Breathe
-              </Text>
-            </View>
-
-            <View style={styles.intentionChip}>
-              <Activity size={14} color={COLORS.primary} />
-              <Text style={styles.intentionChipText}>
-                Move
-              </Text>
-            </View>
-
-            <View style={styles.intentionChip}>
-              <Moon size={14} color={COLORS.primary} />
-              <Text style={styles.intentionChipText}>
-                Rest
-              </Text>
-            </View>
-
-            <View style={styles.intentionChip}>
-              <Zap size={14} color={COLORS.primary} />
-              <Text style={styles.intentionChipText}>
-                Recharge
-              </Text>
-            </View>
-          </View>
-        </View>
-
         <Text style={styles.footerText}>
           Progress at your own pace · Your wellbeing matters 🌿
         </Text>
@@ -452,14 +888,69 @@ export default function ProgressScreen({ user }: Props) {
   );
 }
 
+// ============================================================================
+// STYLES
+// ============================================================================
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.background,
   },
 
+  scrollView: {
+    flex: 1,
+  },
+
   content: {
-    paddingHorizontal: 20,
+    flexGrow: 1,
+  },
+
+  stateContainer: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 30,
+    backgroundColor: COLORS.background,
+  },
+
+  stateTitle: {
+    color: COLORS.text,
+    fontSize: 19,
+    fontWeight: "800",
+    marginTop: 18,
+    textAlign: "center",
+  },
+
+  stateDescription: {
+    color: COLORS.secondary,
+    fontSize: 13,
+    lineHeight: 20,
+    textAlign: "center",
+    marginTop: 8,
+  },
+
+  errorIcon: {
+    width: 65,
+    height: 65,
+    borderRadius: 22,
+    backgroundColor: COLORS.primaryLight,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  retryButton: {
+    marginTop: 22,
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: COLORS.primaryLight,
+  },
+
+  retryButtonText: {
+    color: COLORS.primary,
+    fontSize: 14,
+    fontWeight: "800",
   },
 
   header: {
@@ -665,6 +1156,11 @@ const styles = StyleSheet.create({
     marginBottom: 15,
   },
 
+  sectionHeaderText: {
+    flex: 1,
+    paddingRight: 10,
+  },
+
   sectionTitle: {
     fontSize: 18,
     fontWeight: "850",
@@ -691,12 +1187,11 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     justifyContent: "space-between",
-    marginBottom: 30,
     gap: 12,
+    marginBottom: 30,
   },
 
   statCard: {
-    width: (SCREEN_WIDTH - 40 - 12) / 2,
     backgroundColor: COLORS.surface,
     borderRadius: 23,
     padding: 15,
@@ -769,7 +1264,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.surface,
     borderRadius: 25,
     padding: 19,
-    marginBottom: 22,
+    marginBottom: 25,
     borderWidth: 1,
     borderColor: COLORS.border,
     elevation: 3,
@@ -852,7 +1347,7 @@ const styles = StyleSheet.create({
 
   bar: {
     width: 24,
-    minHeight: 7,
+    minHeight: 5,
     borderRadius: 12,
   },
 
@@ -917,6 +1412,112 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
+  emptyChartText: {
+    textAlign: "center",
+    fontSize: 11,
+    color: COLORS.secondary,
+    marginTop: 14,
+  },
+
+  recentCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 23,
+    paddingHorizontal: 16,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    marginBottom: 22,
+  },
+
+  sessionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 14,
+    gap: 11,
+  },
+
+  sessionIcon: {
+    width: 43,
+    height: 43,
+    borderRadius: 15,
+    backgroundColor: "#EAF5ED",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  sessionEmoji: {
+    fontSize: 20,
+  },
+
+  sessionDetails: {
+    flex: 1,
+  },
+
+  sessionTitle: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: COLORS.text,
+  },
+
+  sessionSubtitle: {
+    fontSize: 10,
+    color: COLORS.secondary,
+    marginTop: 5,
+  },
+
+  sessionStatus: {
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    borderRadius: 10,
+  },
+
+  sessionStatusComplete: {
+    backgroundColor: "#E5F5EA",
+  },
+
+  sessionStatusIncomplete: {
+    backgroundColor: "#FFF1E0",
+  },
+
+  sessionStatusText: {
+    fontSize: 9,
+    fontWeight: "800",
+  },
+
+  sessionStatusTextComplete: {
+    color: COLORS.primary,
+  },
+
+  sessionStatusTextIncomplete: {
+    color: "#B87930",
+  },
+
+  sessionDivider: {
+    height: 1,
+    backgroundColor: "#EEF3EF",
+  },
+
+  emptySessions: {
+    alignItems: "center",
+    paddingVertical: 30,
+    paddingHorizontal: 15,
+  },
+
+  emptySessionsTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontWeight: "800",
+    marginTop: 12,
+  },
+
+  emptySessionsText: {
+    color: COLORS.secondary,
+    fontSize: 11,
+    textAlign: "center",
+    lineHeight: 17,
+    marginTop: 5,
+  },
+
   insightCard: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -960,71 +1561,6 @@ const styles = StyleSheet.create({
     color: "#657A6B",
     fontSize: 12,
     lineHeight: 19,
-  },
-
-  intentionCard: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 23,
-    padding: 17,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginBottom: 22,
-  },
-
-  intentionTop: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-
-  intentionIcon: {
-    width: 43,
-    height: 43,
-    borderRadius: 15,
-    backgroundColor: "#E6F5EA",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 12,
-  },
-
-  intentionHeading: {
-    flex: 1,
-  },
-
-  intentionTitle: {
-    fontSize: 14,
-    fontWeight: "850",
-    color: COLORS.text,
-  },
-
-  intentionSubtitle: {
-    fontSize: 11,
-    color: COLORS.secondary,
-    marginTop: 4,
-  },
-
-  intentionChips: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    marginTop: 17,
-  },
-
-  intentionChip: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    backgroundColor: "#F1F8F3",
-    borderWidth: 1,
-    borderColor: "#E2EFE5",
-    paddingHorizontal: 11,
-    paddingVertical: 9,
-    borderRadius: 13,
-  },
-
-  intentionChipText: {
-    color: COLORS.primary,
-    fontSize: 11,
-    fontWeight: "750",
   },
 
   footerText: {

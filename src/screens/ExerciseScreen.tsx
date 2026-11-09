@@ -1,5 +1,4 @@
 // src/screens/ExerciseScreen.tsx
-
 import React, {
   useCallback,
   useEffect,
@@ -22,19 +21,18 @@ import {
 } from "react-native";
 
 import LinearGradient from "react-native-linear-gradient";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
   Activity,
-  ArrowDown,
-  ArrowLeft,
   ArrowRight,
   AudioLines,
   Brain,
   CheckCircle2,
   Clock3,
   Compass,
+  Download,
   Dumbbell,
+  Eye,
   Headphones,
   Heart,
   Leaf,
@@ -46,10 +44,13 @@ import {
   Waves,
   Wind,
   X,
-  Zap,
 } from "lucide-react-native";
 
-import { supabase } from "../lib/supabase";
+import { useScreenLayout } from "../context/ScreenLayoutContext";
+
+import AIWellness from "../components/aiwellness";
+import AIVisionExercise from "../components/AIVisionExercise";
+import { exerciseService } from "../services/exerciseService";
 
 import YogaPlayer from "../components/YogaPlayer";
 import GuidedSessionPlayer from "../components/GuidedSessionPlayer";
@@ -85,11 +86,13 @@ type Exercise = {
   difficulty: string | null;
   type: string;
   sensor: string | null;
+
   yoga_video?: {
     youtube_video_id: string;
     title: string;
     duration_seconds: number | null;
   } | null;
+
   audio_tracks?: AudioTrack[];
   has_steps?: boolean;
 };
@@ -99,6 +102,8 @@ type ActivePlayer =
   | { kind: "guided"; exercise: Exercise }
   | { kind: "sensor"; exercise: Exercise }
   | { kind: "audio"; exercise: Exercise }
+  | { kind: "ai-wellness"; exercise: Exercise }
+  | { kind: "ai-vision"; exercise: Exercise }
   | null;
 
 type CategoryConfig = {
@@ -108,8 +113,78 @@ type CategoryConfig = {
   background: string;
 };
 
+type OfflineStatus = {
+  available: boolean;
+  exerciseCount: number;
+  downloadedAt: string | null;
+};
+
 // ============================================================================
-// THEME
+// AI WELLNESS VIRTUAL EXERCISE
+// ============================================================================
+
+const AI_WELLNESS_EXERCISE: Exercise = {
+  id: "ai-wellness-session",
+  title: "AI Wellness Session",
+  description:
+    "A personalised breathing and mindfulness session shaped around how you feel and what you need today.",
+  category: "AI",
+  icon: "sparkles",
+  duration_minutes: 3,
+  difficulty: "Beginner",
+  type: "ai-wellness",
+  sensor: null,
+  audio_tracks: [],
+  has_steps: false,
+};
+
+function isAIWellnessExercise(exercise: Exercise): boolean {
+  const normalise = (value: unknown) =>
+    String(value ?? "")
+      .toLowerCase()
+      .replace(/[\s_-]/g, "");
+
+  return (
+    normalise(exercise.id) === "aiwellnesssession" ||
+    normalise(exercise.type) === "aiwellness" ||
+    normalise(exercise.title) === "aiwellnesssession"
+  );
+}
+
+// ============================================================================
+// AI VISION VIRTUAL EXERCISE
+// ============================================================================
+
+const AI_VISION_EXERCISE: Exercise = {
+  id: "ai-vision-exercise",
+  title: "AI Vision Exercise",
+  description:
+    "An interactive exercise experience powered by AI vision.",
+  category: "AI",
+  icon: "eye",
+  duration_minutes: null,
+  difficulty: "Beginner",
+  type: "ai-vision",
+  sensor: null,
+  audio_tracks: [],
+  has_steps: false,
+};
+
+function isAIVisionExercise(exercise: Exercise): boolean {
+  const normalise = (value: unknown) =>
+    String(value ?? "")
+      .toLowerCase()
+      .replace(/[\s_-]/g, "");
+
+  return (
+    normalise(exercise.id) === "aivisionexercise" ||
+    normalise(exercise.type) === "aivision" ||
+    normalise(exercise.title) === "aivisionexercise"
+  );
+}
+
+// ============================================================================
+// COLOURS
 // ============================================================================
 
 const COLORS = {
@@ -122,13 +197,20 @@ const COLORS = {
   secondaryText: "#78867C",
   muted: "#A1ADA4",
   border: "#E5EDE7",
+
   lavender: "#EDE9FF",
   lavenderText: "#7260C4",
+
   peach: "#FFF0E4",
   peachText: "#C77946",
+
   blue: "#E6F1FF",
   blueText: "#4F83BE",
 };
+
+// ============================================================================
+// CATEGORIES
+// ============================================================================
 
 const CATEGORIES: CategoryConfig[] = [
   {
@@ -185,11 +267,12 @@ const CATEGORIES: CategoryConfig[] = [
 // HELPERS
 // ============================================================================
 
-function getCategoryConfig(category?: string) {
+function getCategoryConfig(category?: string): CategoryConfig {
   return (
     CATEGORIES.find(
-      (item) =>
-        item.name.toLowerCase() === category?.toLowerCase(),
+      item =>
+        item.name.toLowerCase() ===
+        (category || "").toLowerCase(),
     ) ?? {
       name: category || "Wellness",
       icon: Leaf,
@@ -200,21 +283,39 @@ function getCategoryConfig(category?: string) {
 }
 
 function getExerciseIcon(exercise: Exercise) {
-  const value = `${exercise.icon ?? ""} ${exercise.type} ${exercise.category}`
-    .toLowerCase();
+  if (isAIVisionExercise(exercise)) {
+    return Eye;
+  }
+
+  if (isAIWellnessExercise(exercise)) {
+    return Sparkles;
+  }
+
+  const iconText = String(exercise.icon ?? "");
+  const typeText = String(exercise.type ?? "");
+  const categoryText = String(exercise.category ?? "");
+
+  const value = (
+    iconText + " " + typeText + " " + categoryText
+  ).toLowerCase();
 
   if (exercise.sensor) return Smartphone;
   if (value.includes("yoga")) return Activity;
+
   if (value.includes("music") || value.includes("audio")) {
     return Headphones;
   }
+
   if (value.includes("sleep")) return Moon;
+
   if (value.includes("breath") || value.includes("relax")) {
     return Wind;
   }
+
   if (value.includes("physical") || value.includes("fitness")) {
     return Dumbbell;
   }
+
   if (value.includes("mental") || value.includes("mind")) {
     return Brain;
   }
@@ -224,161 +325,238 @@ function getExerciseIcon(exercise: Exercise) {
 
 function getExercisePalette(exercise: Exercise) {
   const category = getCategoryConfig(exercise.category);
+
   return {
     background: category.background,
     foreground: category.color,
   };
 }
 
+function formatDownloadedDate(value: string | null) {
+  if (!value) return null;
+
+  const date = new Date(value);
+
+  return Number.isNaN(date.getTime())
+    ? null
+    : date.toLocaleString();
+}
+
+function normalizeCatalog(catalog: any[]): Exercise[] {
+  return catalog.map((item: any) => ({
+    id: String(item.id),
+    title: item.title ?? "Untitled exercise",
+    description: item.description ?? "",
+    category: item.category ?? "Wellness",
+    icon: item.icon ?? null,
+    duration_minutes: item.duration_minutes ?? null,
+    difficulty: item.difficulty ?? null,
+    type: item.type ?? "guided",
+    sensor: item.sensor ?? null,
+
+    yoga_video: item.yoga_video
+      ? {
+          youtube_video_id:
+            item.yoga_video.youtube_video_id ?? "",
+          title:
+            item.yoga_video.title ??
+            item.title ??
+            "Yoga video",
+          duration_seconds:
+            item.yoga_video.duration_seconds ?? null,
+        }
+      : null,
+
+    audio_tracks: (item.audio_tracks ?? [])
+      .filter(
+        (track: any) =>
+          track.media_type === "audio" &&
+          Boolean(track.source_url),
+      )
+      .map((track: any) => ({
+        id: String(track.id),
+        title: track.title ?? "Audio session",
+        artist: track.artist ?? null,
+        source_url: track.source_url,
+        thumbnail_url: track.thumbnail_url ?? null,
+        duration_seconds: track.duration_seconds ?? null,
+        loop: track.loop ?? false,
+        autoplay: track.autoplay ?? true,
+      })),
+
+    has_steps:
+      item.has_steps ??
+      (Array.isArray(item.steps) && item.steps.length > 0),
+  }));
+}
+
 // ============================================================================
-// SCREEN
+// MAIN SCREEN
 // ============================================================================
 
 export default function ExerciseScreen({ user }: Props) {
-  const insets = useSafeAreaInsets();
+  const layout = useScreenLayout();
+
+  // --------------------------------------------------------------------------
+  // STATE
+  // --------------------------------------------------------------------------
 
   const [exercises, setExercises] = useState<Exercise[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedCategory, setSelectedCategory] = useState("All");
+
+  const [selectedCategory, setSelectedCategory] =
+    useState("All");
+
   const [searchQuery, setSearchQuery] = useState("");
+
   const [active, setActive] = useState<ActivePlayer>(null);
+
+  const [offlineDownloading, setOfflineDownloading] =
+    useState(false);
+
+  const [offlineStatus, setOfflineStatus] =
+    useState<OfflineStatus>({
+      available: false,
+      exerciseCount: 0,
+      downloadedAt: null,
+    });
 
   // --------------------------------------------------------------------------
   // LOAD EXERCISES
   // --------------------------------------------------------------------------
 
-  const loadExercises = useCallback(async (isRefresh = false) => {
-    if (isRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
-    }
-
-    try {
-      const { data, error } = await supabase
-        .from("exercises")
-        .select(`
-          id,
-          title,
-          description,
-          category,
-          icon,
-          duration_minutes,
-          difficulty,
-          type,
-          sensor,
-          yoga_videos (
-            youtube_video_id,
-            title,
-            duration_seconds,
-            is_active
-          ),
-          media_items (
-            id,
-            title,
-            artist,
-            source_url,
-            thumbnail_url,
-            duration_seconds,
-            loop,
-            autoplay,
-            media_type,
-            is_active
-          ),
-          exercise_steps ( id )
-        `)
-        .eq("is_active", true)
-        .order("category")
-        .order("title");
-
-      if (error) {
-        throw error;
+  const loadExercises = useCallback(
+    async (isRefresh = false) => {
+      if (isRefresh) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
       }
 
-      const normalized: Exercise[] = (data ?? []).map(
-        (row: any) => {
-          const video = Array.isArray(row.yoga_videos)
-            ? row.yoga_videos.find(
-                (item: any) => item.is_active,
-              )
-            : null;
+      try {
+        const catalog =
+          await exerciseService.listWithDetails();
 
-          const tracks: AudioTrack[] = Array.isArray(
-            row.media_items,
-          )
-            ? row.media_items
-                .filter(
-                  (item: any) =>
-                    item.is_active &&
-                    item.media_type === "audio",
-                )
-                .map((item: any) => ({
-                  id: item.id,
-                  title: item.title,
-                  artist: item.artist,
-                  source_url: item.source_url,
-                  thumbnail_url: item.thumbnail_url,
-                  duration_seconds: item.duration_seconds,
-                  loop: item.loop,
-                  autoplay: item.autoplay,
-                }))
-            : [];
+        setExercises(normalizeCatalog(catalog ?? []));
+      } catch (error: unknown) {
+        console.error(
+          "[ExerciseScreen] Load failed:",
+          error,
+        );
 
-          const hasSteps =
-            Array.isArray(row.exercise_steps) &&
-            row.exercise_steps.length > 0;
+        Alert.alert(
+          "Unable to load exercises",
+          error instanceof Error
+            ? error.message
+            : "Check your internet connection and try again.",
+        );
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [],
+  );
 
-          return {
-            id: row.id,
-            title: row.title,
-            description: row.description ?? "",
-            category: row.category ?? "Wellness",
-            icon: row.icon,
-            duration_minutes: row.duration_minutes,
-            difficulty: row.difficulty,
-            type: row.type,
-            sensor: row.sensor,
-            yoga_video: video
-              ? {
-                  youtube_video_id: video.youtube_video_id,
-                  title: video.title,
-                  duration_seconds: video.duration_seconds,
-                }
-              : null,
-            audio_tracks: tracks,
-            has_steps: hasSteps,
-          };
-        },
+  // --------------------------------------------------------------------------
+  // OFFLINE STATUS
+  // --------------------------------------------------------------------------
+
+  const refreshOfflineStatus = useCallback(async () => {
+    try {
+      const status =
+        await exerciseService.getOfflineStatus();
+
+      setOfflineStatus(status);
+    } catch (error) {
+      console.warn(
+        "[ExerciseScreen] Could not read offline status:",
+        error,
       );
-
-      setExercises(normalized);
-    } catch (error: any) {
-      console.error("[ExerciseScreen] Load failed:", error);
-
-      Alert.alert(
-        "Unable to load exercises",
-        error?.message ??
-          "Please check your connection and try again.",
-      );
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
     }
   }, []);
 
+  // --------------------------------------------------------------------------
+  // INITIAL LOAD
+  // --------------------------------------------------------------------------
+
   useEffect(() => {
     void loadExercises();
-  }, [loadExercises]);
+    void refreshOfflineStatus();
+  }, [loadExercises, refreshOfflineStatus]);
 
   // --------------------------------------------------------------------------
-  // FILTER + SEARCH
+  // DOWNLOAD EXERCISES
+  // --------------------------------------------------------------------------
+
+  const downloadExercisesForOffline = useCallback(
+    async () => {
+      if (offlineDownloading) return;
+
+      setOfflineDownloading(true);
+
+      try {
+        const result =
+          await exerciseService.downloadForOffline();
+
+        await refreshOfflineStatus();
+
+        const catalog =
+          await exerciseService.listWithDetails();
+
+        setExercises(normalizeCatalog(catalog ?? []));
+
+        Alert.alert(
+          "Download complete",
+          `${result.exerciseCount} exercises have been saved for offline browsing.`,
+        );
+      } catch (error: unknown) {
+        console.error(
+          "[ExerciseScreen] Offline download failed:",
+          error,
+        );
+
+        Alert.alert(
+          "Download unsuccessful",
+          error instanceof Error
+            ? error.message
+            : "Could not download the exercises. Check your internet connection and try again.",
+        );
+      } finally {
+        setOfflineDownloading(false);
+        await refreshOfflineStatus();
+      }
+    },
+    [offlineDownloading, refreshOfflineStatus],
+  );
+
+  // --------------------------------------------------------------------------
+  // FEATURED AI WELLNESS EXERCISE
+  // --------------------------------------------------------------------------
+
+  const featuredExercise = AI_WELLNESS_EXERCISE;
+
+  // --------------------------------------------------------------------------
+  // FILTER EXERCISES
   // --------------------------------------------------------------------------
 
   const filteredExercises = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
 
-    return exercises.filter((exercise) => {
+    const normalExercises = exercises.filter(
+      exercise =>
+        !isAIWellnessExercise(exercise) &&
+        !isAIVisionExercise(exercise),
+    );
+
+    const catalogue = [
+      ...normalExercises,
+      AI_WELLNESS_EXERCISE,
+      AI_VISION_EXERCISE,
+    ];
+
+    return catalogue.filter(exercise => {
       const matchesCategory =
         selectedCategory === "All" ||
         exercise.category.toLowerCase() ===
@@ -395,69 +573,121 @@ export default function ExerciseScreen({ user }: Props) {
     });
   }, [exercises, selectedCategory, searchQuery]);
 
-  const featuredExercise = useMemo(
-    () =>
-      exercises.find(
-        (exercise) =>
-          exercise.type === "yoga" ||
-          exercise.category.toLowerCase() === "relax",
-      ) ?? exercises[0],
-    [exercises],
-  );
+  // --------------------------------------------------------------------------
+  // CATEGORY COUNTS
+  // --------------------------------------------------------------------------
 
   const categoryCounts = useMemo(() => {
+    const normalExercises = exercises.filter(
+      exercise =>
+        !isAIWellnessExercise(exercise) &&
+        !isAIVisionExercise(exercise),
+    );
+
     const counts: Record<string, number> = {
-      All: exercises.length,
+      All: normalExercises.length + 2,
     };
 
-    for (const exercise of exercises) {
-      const matchingCategory = CATEGORIES.find(
-        (category) =>
-          category.name.toLowerCase() ===
+    for (const exercise of normalExercises) {
+      const category = CATEGORIES.find(
+        item =>
+          item.name.toLowerCase() ===
           exercise.category.toLowerCase(),
       );
 
-      if (matchingCategory) {
-        counts[matchingCategory.name] =
-          (counts[matchingCategory.name] ?? 0) + 1;
+      if (category) {
+        counts[category.name] =
+          (counts[category.name] ?? 0) + 1;
       }
     }
+
+    counts.AI = (counts.AI ?? 0) + 2;
 
     return counts;
   }, [exercises]);
 
   // --------------------------------------------------------------------------
-  // PLAYER ROUTER
+  // PLAYER ROUTING
   // --------------------------------------------------------------------------
 
   const startExercise = useCallback((exercise: Exercise) => {
-    // Sensor-based exercises take priority.
-    if (exercise.sensor) {
-      setActive({ kind: "sensor", exercise });
+    console.log("[ExerciseScreen] Selected exercise:", {
+      id: exercise.id,
+      title: exercise.title,
+      type: exercise.type,
+      category: exercise.category,
+    });
+
+    if (isAIWellnessExercise(exercise)) {
+      console.log("[ExerciseScreen] Routing to AIWellness");
+
+      setActive({
+        kind: "ai-wellness",
+        exercise: AI_WELLNESS_EXERCISE,
+      });
+
       return;
     }
 
-    if (exercise.type === "yoga" && exercise.yoga_video) {
-      setActive({ kind: "yoga", exercise });
+    if (isAIVisionExercise(exercise)) {
+      console.log(
+        "[ExerciseScreen] Routing to AIVisionExercise",
+      );
+
+      setActive({
+        kind: "ai-vision",
+        exercise: AI_VISION_EXERCISE,
+      });
+
+      return;
+    }
+
+    if (exercise.sensor) {
+      setActive({
+        kind: "sensor",
+        exercise,
+      });
+
+      return;
+    }
+
+    if (
+      exercise.type.toLowerCase() === "yoga" &&
+      exercise.yoga_video
+    ) {
+      setActive({
+        kind: "yoga",
+        exercise,
+      });
+
       return;
     }
 
     if ((exercise.audio_tracks?.length ?? 0) > 0) {
-      setActive({ kind: "audio", exercise });
+      setActive({
+        kind: "audio",
+        exercise,
+      });
+
       return;
     }
 
-    setActive({ kind: "guided", exercise });
-  }, []);
-
-  const closePlayer = useCallback(() => {
-    setActive(null);
-    // Refresh the catalog in case related data changed during a session.
-    // Progress metrics are loaded by their own screen/service.
+    setActive({
+      kind: "guided",
+      exercise,
+    });
   }, []);
 
   // --------------------------------------------------------------------------
-  // LOADING STATE
+  // CLOSE PLAYER
+  // --------------------------------------------------------------------------
+
+  const closePlayer = useCallback(() => {
+    setActive(null);
+  }, []);
+
+  // --------------------------------------------------------------------------
+  // LOADING SCREEN
   // --------------------------------------------------------------------------
 
   if (loading) {
@@ -466,6 +696,7 @@ export default function ExerciseScreen({ user }: Props) {
         <StatusBar
           barStyle="dark-content"
           backgroundColor={COLORS.background}
+          translucent={false}
         />
 
         <View style={styles.loadingIcon}>
@@ -473,6 +704,7 @@ export default function ExerciseScreen({ user }: Props) {
             colors={["#D9F5E3", "#BCE7CB", "#E8F8ED"]}
             style={StyleSheet.absoluteFill}
           />
+
           <Activity size={34} color={COLORS.primary} />
         </View>
 
@@ -493,27 +725,32 @@ export default function ExerciseScreen({ user }: Props) {
     );
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // MAIN UI
-  // --------------------------------------------------------------------------
+  // ==========================================================================
 
   return (
     <View style={styles.container}>
       <StatusBar
         barStyle="dark-content"
         backgroundColor={COLORS.background}
+        translucent={false}
       />
 
       <ScrollView
-        showsVerticalScrollIndicator={false}
-        keyboardShouldPersistTaps="handled"
+        style={styles.mainScrollView}
         contentContainerStyle={[
           styles.scrollContent,
           {
-            paddingTop: Math.max(insets.top, 10) + 8,
-            paddingBottom: 145,
+            paddingTop: layout.topPadding,
+            paddingHorizontal: layout.horizontalPadding,
+            paddingBottom: layout.bottomPadding,
           },
         ]}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+        contentInsetAdjustmentBehavior="never"
+        automaticallyAdjustContentInsets={false}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -523,7 +760,7 @@ export default function ExerciseScreen({ user }: Props) {
           />
         }
       >
-        {/* HEADER */}
+        {/* TOP BAR */}
 
         <View style={styles.topBar}>
           <View style={styles.brandMark}>
@@ -531,24 +768,30 @@ export default function ExerciseScreen({ user }: Props) {
               colors={["#3FA56B", "#1D7042"]}
               style={StyleSheet.absoluteFill}
             />
+
             <Leaf size={22} color="#FFFFFF" />
           </View>
 
           <View style={styles.brandText}>
-            <Text style={styles.eyebrow}>YOUR DAILY RITUAL</Text>
-            <Text style={styles.brandTitle}>Wellness space</Text>
+            <Text style={styles.eyebrow}>
+              YOUR DAILY RITUAL
+            </Text>
+
+            <Text style={styles.brandTitle}>
+              Wellness space
+            </Text>
           </View>
 
           <View style={styles.headerBadge}>
-            <Sparkles
-              size={15}
-              color={COLORS.primary}
-            />
+            <Sparkles size={15} color={COLORS.primary} />
+
             <Text style={styles.headerBadgeText}>
               Feel better
             </Text>
           </View>
         </View>
+
+        {/* PAGE HEADING */}
 
         <View style={styles.headingBlock}>
           <Text style={styles.pageTitle}>
@@ -563,98 +806,174 @@ export default function ExerciseScreen({ user }: Props) {
           </Text>
         </View>
 
-        {/* FEATURED HERO */}
+        {/* FEATURED AI WELLNESS CARD */}
 
-        {featuredExercise && (
-          <TouchableOpacity
-            activeOpacity={0.92}
-            onPress={() => startExercise(featuredExercise)}
-            accessibilityRole="button"
-            accessibilityLabel={`Start featured exercise ${featuredExercise.title}`}
+        <TouchableOpacity
+          activeOpacity={0.92}
+          onPress={() => startExercise(featuredExercise)}
+        >
+          <LinearGradient
+            colors={["#267C4B", "#17613A", "#104B30"]}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            style={styles.heroCard}
           >
-            <LinearGradient
-              colors={["#267C4B", "#17613A", "#104B30"]}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.heroCard}
-            >
-              <View style={styles.heroOrbOne} />
-              <View style={styles.heroOrbTwo} />
+            <View style={styles.heroOrbOne} />
+            <View style={styles.heroOrbTwo} />
 
-              <View style={styles.heroTopRow}>
-                <View style={styles.heroLabel}>
-                  <Sparkles size={13} color="#D8F7E2" />
-                  <Text style={styles.heroLabelText}>
-                    EDITOR'S PICK
-                  </Text>
-                </View>
+            <View style={styles.heroTopRow}>
+              <View style={styles.heroLabel}>
+                <Sparkles size={13} color="#D8F7E2" />
 
-                <View style={styles.heroGlassIcon}>
-                  <Waves size={20} color="#FFFFFF" />
-                </View>
+                <Text style={styles.heroLabelText}>
+                  AI WELLNESS EXPERIENCE
+                </Text>
               </View>
 
-              <View style={styles.heroArt}>
-                <View style={styles.heroRingOuter}>
-                  <View style={styles.heroRingInner}>
-                    <View style={styles.heroCenter}>
-                      {React.createElement(
-                        getExerciseIcon(featuredExercise),
-                        {
-                          size: 38,
-                          color: "#FFFFFF",
-                          strokeWidth: 1.7,
-                        },
-                      )}
-                    </View>
+              <View style={styles.heroGlassIcon}>
+                <Brain size={20} color="#FFFFFF" />
+              </View>
+            </View>
+
+            <View style={styles.heroArt}>
+              <View style={styles.heroRingOuter}>
+                <View style={styles.heroRingInner}>
+                  <View style={styles.heroCenter}>
+                    <Sparkles
+                      size={38}
+                      color="#FFFFFF"
+                      strokeWidth={1.7}
+                    />
                   </View>
                 </View>
-
-                <View style={styles.heroFloatingDot} />
-                <View style={styles.heroFloatingDotSmall} />
               </View>
 
-              <Text style={styles.heroKicker}>
-                A MOMENT JUST FOR YOU
-              </Text>
+              <View style={styles.heroFloatingDot} />
+              <View style={styles.heroFloatingDotSmall} />
+            </View>
 
-              <Text style={styles.heroTitle}>
-                {featuredExercise.title}
-              </Text>
+            <Text style={styles.heroKicker}>
+              A MOMENT JUST FOR YOU
+            </Text>
 
-              <Text
-                style={styles.heroDescription}
-                numberOfLines={2}
-              >
-                {featuredExercise.description ||
-                  "Pause, recharge, and reconnect with yourself."}
-              </Text>
+            <Text style={styles.heroTitle}>
+              AI Wellness Session
+            </Text>
 
-              <View style={styles.heroBottomRow}>
-                <View style={styles.heroMeta}>
-                  <Clock3 size={15} color="#D5EEDF" />
-                  <Text style={styles.heroMetaText}>
-                    {featuredExercise.duration_minutes != null
-                      ? `${featuredExercise.duration_minutes} min`
-                      : "Your own pace"}
-                  </Text>
-                </View>
+            <Text style={styles.heroDescription}>
+              A personalised breathing and mindfulness session
+              shaped around how you feel and what you need today.
+            </Text>
 
-                <View style={styles.heroPlayButton}>
-                  <Text style={styles.heroPlayText}>
-                    Start session
-                  </Text>
-                  <ArrowRight
-                    size={17}
-                    color={COLORS.primaryDark}
-                  />
-                </View>
+            <View style={styles.heroBottomRow}>
+              <View style={styles.heroMeta}>
+                <Clock3 size={15} color="#D5EEDF" />
+
+                <Text style={styles.heroMetaText}>
+                  Choose your duration
+                </Text>
               </View>
-            </LinearGradient>
+
+              <View style={styles.heroPlayButton}>
+                <Text style={styles.heroPlayText}>
+                  Start session
+                </Text>
+
+                <ArrowRight
+                  size={17}
+                  color={COLORS.primaryDark}
+                />
+              </View>
+            </View>
+          </LinearGradient>
+        </TouchableOpacity>
+
+        {/* OFFLINE DOWNLOAD CARD */}
+
+        <View style={styles.offlineCard}>
+          <View style={styles.offlineCardHeader}>
+            <View style={styles.offlineIcon}>
+              <Download size={22} color={COLORS.primary} />
+            </View>
+
+            <View style={styles.offlineCardText}>
+              <Text style={styles.offlineTitle}>
+                Your exercises, anywhere
+              </Text>
+
+              <Text style={styles.offlineSubtitle}>
+                Save the exercise catalogue to your device so you
+                can browse activities without an internet connection.
+              </Text>
+            </View>
+          </View>
+
+          <TouchableOpacity
+            activeOpacity={0.85}
+            onPress={() => void downloadExercisesForOffline()}
+            disabled={offlineDownloading}
+            style={[
+              styles.offlineButton,
+              offlineDownloading &&
+                styles.offlineButtonDisabled,
+            ]}
+          >
+            {offlineDownloading ? (
+              <ActivityIndicator
+                size="small"
+                color="#FFFFFF"
+              />
+            ) : (
+              <Download size={18} color="#FFFFFF" />
+            )}
+
+            <Text style={styles.offlineButtonText}>
+              {offlineDownloading
+                ? "Downloading catalogue..."
+                : offlineStatus.available
+                  ? "Update Offline Exercises"
+                  : "Download for Offline Use"}
+            </Text>
           </TouchableOpacity>
-        )}
 
-        {/* SMALL STATS STRIP */}
+          <View style={styles.offlineStatusRow}>
+            <View
+              style={[
+                styles.offlineStatusDot,
+                offlineStatus.available
+                  ? styles.offlineStatusDotActive
+                  : styles.offlineStatusDotInactive,
+              ]}
+            />
+
+            <Text style={styles.offlineStatusText}>
+              {offlineStatus.available
+                ? `${offlineStatus.exerciseCount} exercises saved on this device`
+                : "No offline catalogue downloaded yet"}
+            </Text>
+
+            {offlineStatus.available && (
+              <CheckCircle2
+                size={15}
+                color={COLORS.primary}
+              />
+            )}
+          </View>
+
+          {offlineStatus.downloadedAt ? (
+            <Text style={styles.offlineDate}>
+              Last downloaded:{" "}
+              {formatDownloadedDate(offlineStatus.downloadedAt)}
+            </Text>
+          ) : null}
+
+          <Text style={styles.offlineDisclaimer}>
+            Exercise information and instructions are saved locally.
+            Streaming audio and video may still require internet access.
+          </Text>
+        </View>
+
+        {/* INTRO STRIP */}
 
         <View style={styles.introStrip}>
           <View style={styles.introIcon}>
@@ -665,6 +984,7 @@ export default function ExerciseScreen({ user }: Props) {
             <Text style={styles.introTitle}>
               Your wellbeing, your pace
             </Text>
+
             <Text style={styles.introSubtitle}>
               No pressure. Just progress, one session at a time.
             </Text>
@@ -682,6 +1002,7 @@ export default function ExerciseScreen({ user }: Props) {
             <Text style={styles.sectionTitle}>
               Explore activities
             </Text>
+
             <Text style={styles.sectionSubtitle}>
               Find what feels right today
             </Text>
@@ -728,7 +1049,7 @@ export default function ExerciseScreen({ user }: Props) {
           nestedScrollEnabled
           contentContainerStyle={styles.categoryList}
         >
-          {CATEGORIES.map((category) => {
+          {CATEGORIES.map(category => {
             const Icon = category.icon;
             const selected =
               selectedCategory === category.name;
@@ -756,17 +1077,19 @@ export default function ExerciseScreen({ user }: Props) {
                 <Text
                   style={[
                     styles.categoryChipText,
-                    selected && styles.categoryChipTextActive,
+                    selected &&
+                      styles.categoryChipTextActive,
                   ]}
                 >
                   {category.name}
                 </Text>
 
-                {categoryCounts[category.name] > 0 && (
+                {(categoryCounts[category.name] ?? 0) > 0 && (
                   <Text
                     style={[
                       styles.categoryCount,
-                      selected && styles.categoryCountActive,
+                      selected &&
+                        styles.categoryCountActive,
                     ]}
                   >
                     {categoryCounts[category.name]}
@@ -777,16 +1100,22 @@ export default function ExerciseScreen({ user }: Props) {
           })}
         </ScrollView>
 
-        {/* EXERCISE CARDS */}
+        {/* EXERCISE LIST */}
 
         <View style={styles.exerciseList}>
           {filteredExercises.length === 0 ? (
             <View style={styles.emptyCard}>
               <View style={styles.emptyIllustration}>
                 {searchQuery ? (
-                  <Search size={32} color={COLORS.primary} />
+                  <Search
+                    size={32}
+                    color={COLORS.primary}
+                  />
                 ) : (
-                  <Leaf size={34} color={COLORS.primary} />
+                  <Leaf
+                    size={34}
+                    color={COLORS.primary}
+                  />
                 )}
               </View>
 
@@ -799,7 +1128,9 @@ export default function ExerciseScreen({ user }: Props) {
               <Text style={styles.emptyDescription}>
                 {searchQuery
                   ? "Try another keyword or choose a different category."
-                  : "There are no activities in this category yet."}
+                  : offlineStatus.available
+                    ? "No activities match this category in your saved catalogue."
+                    : "There are no activities in this category yet."}
               </Text>
 
               {(searchQuery.length > 0 ||
@@ -816,11 +1147,30 @@ export default function ExerciseScreen({ user }: Props) {
                   </Text>
                 </TouchableOpacity>
               )}
+
+              {!offlineStatus.available && (
+                <TouchableOpacity
+                  onPress={() =>
+                    void downloadExercisesForOffline()
+                  }
+                  disabled={offlineDownloading}
+                  style={styles.emptyDownloadButton}
+                >
+                  <Download size={16} color="#FFFFFF" />
+
+                  <Text style={styles.resetButtonText}>
+                    {offlineDownloading
+                      ? "Downloading..."
+                      : "Download exercises"}
+                  </Text>
+                </TouchableOpacity>
+              )}
             </View>
           ) : (
             filteredExercises.map((exercise, index) => {
               const Icon = getExerciseIcon(exercise);
-              const palette = getExercisePalette(exercise);
+              const palette =
+                getExercisePalette(exercise);
 
               const trackCount =
                 exercise.audio_tracks?.length ?? 0;
@@ -828,23 +1178,36 @@ export default function ExerciseScreen({ user }: Props) {
               const isSensor = Boolean(exercise.sensor);
               const isVideo = Boolean(exercise.yoga_video);
               const isAudio = trackCount > 0;
+              const isAIWellness =
+                isAIWellnessExercise(exercise);
+              const isAIVision =
+                isAIVisionExercise(exercise);
 
               let modeLabel = "Guided session";
-              let modeIcon = CheckCircle2;
+              let modeIcon: React.ComponentType<any> =
+                CheckCircle2;
 
-              if (isSensor) {
+              if (isAIVision) {
+                modeLabel = "AI vision experience";
+                modeIcon = Eye;
+              } else if (isAIWellness) {
+                modeLabel = "AI personalised session";
+                modeIcon = Sparkles;
+              } else if (isSensor) {
                 modeLabel = "Sensor experience";
                 modeIcon = Smartphone;
               } else if (
-                exercise.type === "yoga" &&
+                exercise.type.toLowerCase() === "yoga" &&
                 isVideo
               ) {
                 modeLabel = "Video practice";
                 modeIcon = Play;
               } else if (isAudio) {
-                modeLabel = `${trackCount} audio ${
-                  trackCount === 1 ? "track" : "tracks"
-                }`;
+                modeLabel =
+                  String(trackCount) +
+                  " audio " +
+                  (trackCount === 1 ? "track" : "tracks");
+
                 modeIcon = AudioLines;
               }
 
@@ -863,10 +1226,14 @@ export default function ExerciseScreen({ user }: Props) {
                     <View
                       style={[
                         styles.exerciseIconTile,
-                        { backgroundColor: palette.background },
+                        {
+                          backgroundColor:
+                            palette.background,
+                        },
                       ]}
                     >
                       <View style={styles.iconHighlight} />
+
                       <Icon
                         size={27}
                         color={palette.foreground}
@@ -879,7 +1246,9 @@ export default function ExerciseScreen({ user }: Props) {
                         <Text
                           style={[
                             styles.cardCategory,
-                            { color: palette.foreground },
+                            {
+                              color: palette.foreground,
+                            },
                           ]}
                         >
                           {exercise.category.toUpperCase()}
@@ -891,6 +1260,7 @@ export default function ExerciseScreen({ user }: Props) {
                               size={10}
                               color="#B78A34"
                             />
+
                             <Text style={styles.topPickText}>
                               PICK
                             </Text>
@@ -932,14 +1302,17 @@ export default function ExerciseScreen({ user }: Props) {
                       />
 
                       <Text style={styles.cardMetadataText}>
-                        {exercise.duration_minutes != null
-                          ? `${exercise.duration_minutes} min`
-                          : "Flexible duration"}
+                        {isAIWellness
+                          ? "Choose your duration"
+                          : exercise.duration_minutes != null
+                            ? `${exercise.duration_minutes} min`
+                            : "Flexible duration"}
                       </Text>
 
                       {exercise.difficulty ? (
                         <>
                           <View style={styles.metaDot} />
+
                           <Text
                             style={styles.cardMetadataText}
                             numberOfLines={1}
@@ -955,6 +1328,7 @@ export default function ExerciseScreen({ user }: Props) {
                         size={12}
                         color={COLORS.primary}
                       />
+
                       <Text
                         style={styles.modeBadgeText}
                         numberOfLines={1}
@@ -969,7 +1343,7 @@ export default function ExerciseScreen({ user }: Props) {
           )}
         </View>
 
-        {/* BOTTOM ENCOURAGEMENT */}
+        {/* ENCOURAGEMENT */}
 
         {filteredExercises.length > 0 && (
           <View style={styles.encouragement}>
@@ -981,6 +1355,7 @@ export default function ExerciseScreen({ user }: Props) {
               <Text style={styles.encouragementTitle}>
                 Small steps still count.
               </Text>
+
               <Text style={styles.encouragementSubtitle}>
                 Choose an activity and make today yours.
               </Text>
@@ -1000,6 +1375,29 @@ export default function ExerciseScreen({ user }: Props) {
       >
         {active !== null && (
           <View style={styles.playerContainer}>
+            {active.kind === "ai-wellness" && (
+              <AIWellness
+                key="ai-wellness-session"
+                user={user}
+                onClose={completed => {
+                  console.log(
+                    "[ExerciseScreen] AI Wellness closed. Completed:",
+                    completed,
+                  );
+
+                  closePlayer();
+                }}
+              />
+            )}
+
+            {active.kind === "ai-vision" && (
+              <AIVisionExercise
+                key="ai-vision-exercise"
+                user={user}
+                onClose={closePlayer}
+              />
+            )}
+
             {active.kind === "yoga" &&
               active.exercise.yoga_video && (
                 <YogaPlayer
@@ -1024,7 +1422,7 @@ export default function ExerciseScreen({ user }: Props) {
                   category: active.exercise.category,
                   type: active.exercise.type,
                 }}
-                onClose={(_completed) => closePlayer()}
+                onClose={closePlayer}
               />
             )}
 
@@ -1038,7 +1436,7 @@ export default function ExerciseScreen({ user }: Props) {
                   type: active.exercise.type,
                   sensor: active.exercise.sensor,
                 }}
-                onClose={(_completed) => closePlayer()}
+                onClose={closePlayer}
               />
             )}
 
@@ -1052,7 +1450,7 @@ export default function ExerciseScreen({ user }: Props) {
                   type: active.exercise.type,
                 }}
                 tracks={active.exercise.audio_tracks ?? []}
-                onClose={(_completed) => closePlayer()}
+                onClose={closePlayer}
               />
             )}
           </View>
@@ -1063,7 +1461,7 @@ export default function ExerciseScreen({ user }: Props) {
 }
 
 // ============================================================================
-// STYLES — SOFT 3D / GLASS-INSPIRED WELLNESS UI
+// STYLES
 // ============================================================================
 
 const styles = StyleSheet.create({
@@ -1072,11 +1470,13 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.background,
   },
 
-  scrollContent: {
-    paddingHorizontal: 20,
+  mainScrollView: {
+    flex: 1,
   },
 
-  // Loading
+  scrollContent: {
+    flexGrow: 1,
+  },
 
   loadingScreen: {
     flex: 1,
@@ -1121,8 +1521,6 @@ const styles = StyleSheet.create({
   loadingIndicator: {
     marginTop: 22,
   },
-
-  // Header
 
   topBar: {
     flexDirection: "row",
@@ -1184,8 +1582,6 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 
-  // Heading
-
   headingBlock: {
     marginBottom: 22,
   },
@@ -1209,8 +1605,6 @@ const styles = StyleSheet.create({
     color: COLORS.secondaryText,
     maxWidth: 310,
   },
-
-  // Hero card
 
   heroCard: {
     borderRadius: 29,
@@ -1410,7 +1804,113 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 
-  // Intro strip
+  offlineCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 22,
+    padding: 16,
+    marginBottom: 22,
+    borderWidth: 1,
+    borderColor: "#DDEBE2",
+    elevation: 3,
+    shadowColor: "#234D34",
+    shadowOpacity: 0.06,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+  },
+
+  offlineCardHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+    marginBottom: 16,
+  },
+
+  offlineIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 15,
+    backgroundColor: COLORS.primaryLight,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  offlineCardText: {
+    flex: 1,
+  },
+
+  offlineTitle: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: COLORS.text,
+    marginBottom: 5,
+  },
+
+  offlineSubtitle: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: COLORS.secondaryText,
+  },
+
+  offlineButton: {
+    minHeight: 48,
+    borderRadius: 15,
+    backgroundColor: COLORS.primary,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 9,
+    paddingHorizontal: 12,
+  },
+
+  offlineButtonDisabled: {
+    opacity: 0.65,
+  },
+
+  offlineButtonText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
+
+  offlineStatusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 14,
+  },
+
+  offlineStatusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+
+  offlineStatusDotActive: {
+    backgroundColor: "#27965B",
+  },
+
+  offlineStatusDotInactive: {
+    backgroundColor: "#A5ADA8",
+  },
+
+  offlineStatusText: {
+    flex: 1,
+    fontSize: 11,
+    color: COLORS.secondaryText,
+  },
+
+  offlineDate: {
+    marginTop: 7,
+    fontSize: 10,
+    color: COLORS.muted,
+  },
+
+  offlineDisclaimer: {
+    marginTop: 10,
+    fontSize: 10,
+    lineHeight: 15,
+    color: COLORS.secondaryText,
+  },
 
   introStrip: {
     minHeight: 77,
@@ -1466,8 +1966,6 @@ const styles = StyleSheet.create({
     marginLeft: 7,
   },
 
-  // Section heading
-
   sectionHeading: {
     flexDirection: "row",
     alignItems: "center",
@@ -1501,8 +1999,6 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 
-  // Search
-
   searchBox: {
     minHeight: 53,
     borderRadius: 18,
@@ -1531,8 +2027,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
-  // Categories
 
   categoryList: {
     paddingBottom: 19,
@@ -1581,8 +2075,6 @@ const styles = StyleSheet.create({
   categoryCountActive: {
     color: "#D8F1E0",
   },
-
-  // Exercise cards
 
   exerciseList: {
     gap: 13,
@@ -1743,8 +2235,6 @@ const styles = StyleSheet.create({
     flexShrink: 1,
   },
 
-  // Empty state
-
   emptyCard: {
     alignItems: "center",
     paddingHorizontal: 27,
@@ -1794,7 +2284,18 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 
-  // Encouragement
+  emptyDownloadButton: {
+    marginTop: 12,
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: COLORS.primaryDark,
+    paddingHorizontal: 17,
+    paddingVertical: 12,
+    borderRadius: 14,
+  },
 
   encouragement: {
     marginTop: 22,

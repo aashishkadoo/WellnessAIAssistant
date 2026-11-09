@@ -1,5 +1,4 @@
 // src/components/BottomNavigation.tsx
-
 import * as React from "react";
 import {
   View,
@@ -32,36 +31,15 @@ type NavItem = {
 };
 
 const NAV_ITEMS: NavItem[] = [
-  {
-    key: "home",
-    label: "Home",
-    Icon: House,
-  },
-  {
-    key: "exercise",
-    label: "Exercise",
-    Icon: Dumbbell,
-  },
-  {
-    key: "progress",
-    label: "Progress",
-    Icon: ChartNoAxesColumnIncreasing,
-  },
-  {
-    key: "profile",
-    label: "Profile",
-    Icon: UserRound,
-  },
+  { key: "home", label: "Home", Icon: House },
+  { key: "exercise", label: "Exercise", Icon: Dumbbell },
+  { key: "progress", label: "Progress", Icon: ChartNoAxesColumnIncreasing },
+  { key: "profile", label: "Profile", Icon: UserRound },
 ];
 
 type Props = {
   currentScreen: string;
   onNavigate: (screen: string) => void;
-
-  /**
-   * Reports the navigation wrapper's measured height,
-   * including its safe-area padding.
-   */
   onHeightChange?: (height: number) => void;
 };
 
@@ -156,12 +134,10 @@ function NavButton({
   labelSize,
   circleSize,
 }: NavButtonProps) {
-  // Animated active indicator.
   const progress = React.useRef(
     new Animated.Value(active ? 1 : 0)
   ).current;
 
-  // Animated press feedback.
   const pressScale = React.useRef(
     new Animated.Value(1)
   ).current;
@@ -176,9 +152,7 @@ function NavButton({
 
     animation.start();
 
-    return () => {
-      animation.stop();
-    };
+    return () => animation.stop();
   }, [active, progress]);
 
   const handlePressIn = () => {
@@ -223,9 +197,7 @@ function NavButton({
       <Animated.View
         style={[
           styles.iconRow,
-          {
-            transform: [{ scale: pressScale }],
-          },
+          { transform: [{ scale: pressScale }] },
         ]}
       >
         <View
@@ -234,7 +206,6 @@ function NavButton({
             height: circleSize,
           }}
         >
-          {/* Circular highlight for the active screen. */}
           <Animated.View
             pointerEvents="none"
             style={[
@@ -249,7 +220,6 @@ function NavButton({
             ]}
           />
 
-          {/* Lucide navigation icon. */}
           <View style={styles.iconCenter}>
             <Icon
               size={iconSize}
@@ -260,7 +230,6 @@ function NavButton({
         </View>
       </Animated.View>
 
-      {/* Navigation label. */}
       <Text
         style={[
           styles.label,
@@ -282,6 +251,12 @@ function NavButton({
 
 const styles = StyleSheet.create({
   wrapper: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 100,
+    elevation: 100,
     backgroundColor: "transparent",
   },
 

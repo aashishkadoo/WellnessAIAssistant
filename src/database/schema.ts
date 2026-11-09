@@ -1,5 +1,6 @@
 // src/database/schema.ts
 
+
 export const DATABASE_SCHEMA = `
   PRAGMA foreign_keys = ON;
 
@@ -127,6 +128,7 @@ export const DATABASE_SCHEMA = `
     autoplay INTEGER NOT NULL DEFAULT 1,
     loop INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT,
     synced INTEGER NOT NULL DEFAULT 1
   );
 
@@ -161,6 +163,7 @@ export const DATABASE_SCHEMA = `
     updated_at TEXT NOT NULL
   );
 
+  -- Indexes
   CREATE INDEX IF NOT EXISTS idx_activities_user_date
     ON daily_activities(user_id, activity_date);
 

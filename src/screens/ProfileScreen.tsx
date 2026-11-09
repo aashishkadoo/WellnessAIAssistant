@@ -1,6 +1,11 @@
-//src/screens/ProfileScreen.tsx
+// src/screens/ProfileScreen.tsx
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
-import React from "react";
 import {
   View,
   Text,
@@ -9,8 +14,12 @@ import {
   TouchableOpacity,
   Alert,
   StatusBar,
+  Image,
+  ActivityIndicator,
 } from "react-native";
+
 import LinearGradient from "react-native-linear-gradient";
+
 import {
   UserRound,
   Mail,
@@ -22,9 +31,26 @@ import {
   Sparkles,
   Settings2,
   Heart,
+  Camera,
 } from "lucide-react-native";
+
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { launchImageLibrary } from "react-native-image-picker";
+
 import { supabase } from "../lib/supabase";
+
+import {
+  getCurrentProfile,
+  updateProfilePicture,
+  removeProfilePicture,
+  UserProfile,
+} from "../services/profileService";
+
+import NotificationScreen from "../components/NotificationScreen";
+
+// ============================================================
+// TYPES
+// ============================================================
 
 type Props = {
   user: any;
@@ -35,17 +61,19 @@ type ProfileOptionProps = {
   title: string;
   description: string;
   backgroundColor?: string;
-  iconColor?: string;
   onPress?: () => void;
   showArrow?: boolean;
 };
+
+// ============================================================
+// PROFILE OPTION COMPONENT
+// ============================================================
 
 function ProfileOption({
   icon,
   title,
   description,
   backgroundColor = "#EAF5EE",
-  iconColor = "#247A4A",
   onPress,
   showArrow = false,
 }: ProfileOptionProps) {
@@ -57,7 +85,13 @@ function ProfileOption({
 
       <View style={styles.optionContent}>
         <Text style={styles.optionTitle}>{title}</Text>
-        <Text style={styles.optionDescription}>{description}</Text>
+
+        <Text
+          style={styles.optionDescription}
+          numberOfLines={2}
+        >
+          {description}
+        </Text>
       </View>
 
       {showArrow && (
@@ -84,33 +118,313 @@ function ProfileOption({
     );
   }
 
-  return <View style={styles.optionCard}>{content}</View>;
+  return (
+    <View style={styles.optionCard}>
+      {content}
+    </View>
+  );
 }
+
+// ============================================================
+// PROFILE SCREEN
+// ============================================================
 
 export default function ProfileScreen({ user }: Props) {
   const insets = useSafeAreaInsets();
 
-  const email: string =
-    user?.email || "No email available";
+  // ----------------------------------------------------------
+  // STATE
+  // ----------------------------------------------------------
 
-  const displayName: string =
-    user?.user_metadata?.full_name ||
-    user?.user_metadata?.name ||
-    "Wellness Member";
+  const [profile, setProfile] = useState<UserProfile | null>(null);
 
-  const initial: string =
-    displayName !== "Wellness Member"
-      ? displayName.trim().charAt(0).toUpperCase()
-      : email !== "No email available"
-        ? email.charAt(0).toUpperCase()
-        : "W";
+  const [loadingProfile, setLoadingProfile] = useState(true);
 
-  const memberSince = user?.created_at
-    ? new Date(user.created_at).toLocaleDateString(undefined, {
-        month: "long",
-        year: "numeric",
-      })
-    : null;
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+
+  const [showNotificationScreen, setShowNotificationScreen] =
+    useState(false);
+
+  // ----------------------------------------------------------
+  // PROFILE INFORMATION
+  // ----------------------------------------------------------
+
+  const email = useMemo(() => {
+    return (
+      profile?.email?.trim() ||
+      user?.email?.trim() ||
+      "No email available"
+    );
+  }, [profile?.email, user?.email]);
+
+  const displayName = useMemo(() => {
+    return (
+      profile?.full_name?.trim() ||
+      user?.user_metadata?.full_name?.trim() ||
+      user?.user_metadata?.name?.trim() ||
+      "Wellness Member"
+    );
+  }, [
+    profile?.full_name,
+    user?.user_metadata?.full_name,
+    user?.user_metadata?.name,
+  ]);
+
+  const initial = useMemo(() => {
+    if (displayName !== "Wellness Member") {
+      return displayName.charAt(0).toUpperCase();
+    }
+
+    if (email !== "No email available") {
+      return email.charAt(0).toUpperCase();
+    }
+
+    return "W";
+  }, [displayName, email]);
+
+  const memberSince = useMemo(() => {
+    const dateValue = profile?.created_at || user?.created_at;
+
+    if (!dateValue) {
+      return null;
+    }
+
+    const date = new Date(dateValue);
+
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+
+    return date.toLocaleDateString(undefined, {
+      month: "long",
+      year: "numeric",
+    });
+  }, [profile?.created_at, user?.created_at]);
+
+  // ----------------------------------------------------------
+  // LOAD PROFILE
+  // ----------------------------------------------------------
+
+  const loadProfile = useCallback(async () => {
+    try {
+      setLoadingProfile(true);
+
+      const result = await getCurrentProfile();
+
+      setProfile(result);
+    } catch (error: any) {
+      console.warn(
+        "[ProfileScreen] Profile loading failed:",
+        error,
+      );
+    } finally {
+      setLoadingProfile(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadProfile();
+  }, [loadProfile]);
+
+  // ----------------------------------------------------------
+  // PROFILE IMAGE SOURCE
+  // ----------------------------------------------------------
+
+  const avatarSource = useMemo(() => {
+    if (profile?.avatar_local_data) {
+      return {
+        uri: `data:image/jpeg;base64,${profile.avatar_local_data}`,
+      };
+    }
+
+    if (profile?.avatar_url) {
+      return {
+        uri: profile.avatar_url,
+      };
+    }
+
+    return null;
+  }, [
+    profile?.avatar_local_data,
+    profile?.avatar_url,
+  ]);
+
+  // ----------------------------------------------------------
+  // SELECT PROFILE PICTURE
+  // ----------------------------------------------------------
+
+  const handlePickAvatar = async () => {
+    if (uploadingAvatar) {
+      return;
+    }
+
+    try {
+      const result = await launchImageLibrary({
+        mediaType: "photo",
+        selectionLimit: 1,
+        includeBase64: true,
+        quality: 0.8,
+        maxWidth: 1024,
+        maxHeight: 1024,
+      });
+
+      if (result.didCancel) {
+        return;
+      }
+
+      if (result.errorCode) {
+        Alert.alert(
+          "Unable to select image",
+          result.errorMessage || "Please try again.",
+        );
+
+        return;
+      }
+
+      const selectedImage = result.assets?.[0];
+
+      if (!selectedImage?.base64) {
+        Alert.alert(
+          "Image unavailable",
+          "We couldn't read this image. Please select another one.",
+        );
+
+        return;
+      }
+
+      setUploadingAvatar(true);
+
+      const updatedProfile = await updateProfilePicture(
+        selectedImage.base64,
+      );
+
+      setProfile(updatedProfile);
+
+      Alert.alert(
+        "Profile picture updated",
+        "Your new picture has been saved on this device and is ready to synchronize.",
+      );
+    } catch (error: any) {
+      console.error(
+        "[ProfileScreen] Avatar update failed:",
+        error,
+      );
+
+      Alert.alert(
+        "Unable to update picture",
+        error?.message || "Please try selecting another image.",
+      );
+    } finally {
+      setUploadingAvatar(false);
+    }
+  };
+
+  // ----------------------------------------------------------
+  // REMOVE PROFILE PICTURE
+  // ----------------------------------------------------------
+
+  const handleRemoveAvatar = () => {
+    if (!avatarSource || uploadingAvatar) {
+      return;
+    }
+
+    Alert.alert(
+      "Remove profile picture",
+      "Are you sure you want to remove your profile picture?",
+      [
+        {
+          text: "Cancel",
+          style: "cancel",
+        },
+        {
+          text: "Remove",
+          style: "destructive",
+
+          onPress: async () => {
+            try {
+              setUploadingAvatar(true);
+
+              const updatedProfile =
+                await removeProfilePicture();
+
+              setProfile(updatedProfile);
+
+              Alert.alert(
+                "Picture removed",
+                "Your profile picture removal has been saved.",
+              );
+            } catch (error: any) {
+              console.error(
+                "[ProfileScreen] Avatar removal failed:",
+                error,
+              );
+
+              Alert.alert(
+                "Unable to remove picture",
+                error?.message || "Please try again.",
+              );
+            } finally {
+              setUploadingAvatar(false);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  // ----------------------------------------------------------
+  // PROFILE PICTURE ACTIONS
+  // ----------------------------------------------------------
+
+  const handleAvatarActions = () => {
+    if (uploadingAvatar) {
+      return;
+    }
+
+    Alert.alert(
+      "Profile picture",
+      "Manage your profile picture.",
+      [
+        {
+          text: "Choose a new picture",
+          onPress: () => {
+            void handlePickAvatar();
+          },
+        },
+
+        ...(avatarSource
+          ? [
+              {
+                text: "Remove picture",
+                style: "destructive" as const,
+                onPress: handleRemoveAvatar,
+              },
+            ]
+          : []),
+
+        {
+          text: "Cancel",
+          style: "cancel",
+        },
+      ],
+    );
+  };
+
+  // ----------------------------------------------------------
+  // NOTIFICATIONS NAVIGATION
+  // ----------------------------------------------------------
+
+  const handleOpenNotifications = useCallback(() => {
+    setShowNotificationScreen(true);
+  }, []);
+
+  const handleCloseNotifications = useCallback(() => {
+    setShowNotificationScreen(false);
+  }, []);
+
+  // ----------------------------------------------------------
+  // LOGOUT
+  // ----------------------------------------------------------
 
   const handleLogout = () => {
     Alert.alert(
@@ -121,9 +435,11 @@ export default function ProfileScreen({ user }: Props) {
           text: "Cancel",
           style: "cancel",
         },
+
         {
           text: "Log out",
           style: "destructive",
+
           onPress: async () => {
             try {
               const { error } = await supabase.auth.signOut();
@@ -131,43 +447,78 @@ export default function ProfileScreen({ user }: Props) {
               if (error) {
                 Alert.alert(
                   "Unable to log out",
-                  error.message || "Please try again."
+                  error.message || "Please try again.",
                 );
               }
-            } catch {
+            } catch (error) {
+              console.error(
+                "[ProfileScreen] Logout failed:",
+                error,
+              );
+
               Alert.alert(
                 "Something went wrong",
-                "We couldn't log you out. Please try again."
+                "We couldn't log you out. Please try again.",
               );
             }
           },
         },
-      ]
+      ],
     );
   };
+
+  // ==========================================================
+  // NOTIFICATION SCREEN
+  // ==========================================================
+
+  if (showNotificationScreen) {
+    return (
+      <NotificationScreen
+        user={user}
+        onClose={handleCloseNotifications}
+      />
+    );
+  }
+
+  // ==========================================================
+  // MAIN PROFILE SCREEN
+  // ==========================================================
 
   return (
     <View style={styles.container}>
       <StatusBar
         barStyle="dark-content"
-        backgroundColor="#F4F8F5"
+        backgroundColor="transparent"
+        translucent={true}
       />
 
       <ScrollView
+        style={styles.scrollView}
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={[
           styles.content,
           {
-            paddingTop: Math.max(insets.top, 12) + 8,
-            paddingBottom: Math.max(insets.bottom, 12) + 112,
+            // Background extends behind the transparent status bar.
+            // Content starts safely below the status bar.
+            // No additional top spacing is added.
+            paddingTop: insets.top,
+            paddingBottom: Math.max(insets.bottom, 12) + 105,
           },
         ]}
       >
         {/* PAGE HEADER */}
+
         <View style={styles.pageHeader}>
-          <View>
-            <Text style={styles.eyebrow}>YOUR PERSONAL SPACE</Text>
-            <Text style={styles.pageTitle}>My Profile</Text>
+          <View style={styles.pageHeaderText}>
+            <Text style={styles.eyebrow}>
+              YOUR PERSONAL SPACE
+            </Text>
+
+            <Text style={styles.pageTitle}>
+              My Profile
+            </Text>
+
             <Text style={styles.pageSubtitle}>
               Your wellness journey, all in one place.
             </Text>
@@ -183,6 +534,7 @@ export default function ProfileScreen({ user }: Props) {
         </View>
 
         {/* PROFILE HERO */}
+
         <LinearGradient
           colors={["#287D50", "#17623D", "#124B32"]}
           start={{ x: 0, y: 0 }}
@@ -190,24 +542,63 @@ export default function ProfileScreen({ user }: Props) {
           style={styles.profileHero}
         >
           <View style={styles.heroDecorationOne} />
+
           <View style={styles.heroDecorationTwo} />
 
           <View style={styles.heroTopRow}>
             <View style={styles.avatarOuter}>
-              <LinearGradient
-                colors={["#E7F8ED", "#C6EAD4"]}
-                style={styles.avatar}
+              <TouchableOpacity
+                activeOpacity={0.85}
+                onPress={handleAvatarActions}
+                disabled={uploadingAvatar}
+                accessibilityRole="button"
+                accessibilityLabel="Change profile picture"
               >
-                {displayName !== "Wellness Member" ? (
-                  <Text style={styles.avatarText}>{initial}</Text>
+                <LinearGradient
+                  colors={["#E7F8ED", "#C6EAD4"]}
+                  style={styles.avatar}
+                >
+                  {avatarSource ? (
+                    <Image
+                      source={avatarSource}
+                      style={styles.avatarImage}
+                      resizeMode="cover"
+                    />
+                  ) : displayName !== "Wellness Member" ? (
+                    <Text style={styles.avatarText}>
+                      {initial}
+                    </Text>
+                  ) : (
+                    <UserRound
+                      size={38}
+                      color="#247A4A"
+                      strokeWidth={1.8}
+                    />
+                  )}
+                </LinearGradient>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.cameraButton}
+                onPress={handleAvatarActions}
+                disabled={uploadingAvatar}
+                activeOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityLabel="Select profile picture"
+              >
+                {uploadingAvatar ? (
+                  <ActivityIndicator
+                    size="small"
+                    color="#FFFFFF"
+                  />
                 ) : (
-                  <UserRound
-                    size={38}
-                    color="#247A4A"
-                    strokeWidth={1.8}
+                  <Camera
+                    size={15}
+                    color="#FFFFFF"
+                    strokeWidth={2.5}
                   />
                 )}
-              </LinearGradient>
+              </TouchableOpacity>
 
               <View style={styles.onlineIndicator} />
             </View>
@@ -218,11 +609,17 @@ export default function ProfileScreen({ user }: Props) {
                 color="#D5F4DE"
                 strokeWidth={2}
               />
-              <Text style={styles.memberBadgeText}>MEMBER</Text>
+
+              <Text style={styles.memberBadgeText}>
+                MEMBER
+              </Text>
             </View>
           </View>
 
-          <Text style={styles.profileName} numberOfLines={1}>
+          <Text
+            style={styles.profileName}
+            numberOfLines={1}
+          >
             {displayName}
           </Text>
 
@@ -232,10 +629,39 @@ export default function ProfileScreen({ user }: Props) {
               color="#D2EBDD"
               strokeWidth={1.8}
             />
-            <Text style={styles.profileEmail} numberOfLines={2}>
+
+            <Text
+              style={styles.profileEmail}
+              numberOfLines={2}
+            >
               {email}
             </Text>
           </View>
+
+          <TouchableOpacity
+            style={styles.changePhotoButton}
+            onPress={handleAvatarActions}
+            disabled={uploadingAvatar}
+            activeOpacity={0.8}
+          >
+            <Camera
+              size={13}
+              color="#E1F6E8"
+            />
+
+            <Text style={styles.changePhotoText}>
+              {uploadingAvatar
+                ? "Updating picture..."
+                : avatarSource
+                  ? "Change profile picture"
+                  : "Add profile picture"}
+            </Text>
+
+            <ChevronRight
+              size={15}
+              color="#D5F4DE"
+            />
+          </TouchableOpacity>
 
           <View style={styles.heroDivider} />
 
@@ -252,6 +678,7 @@ export default function ProfileScreen({ user }: Props) {
               <Text style={styles.memberFooterTitle}>
                 Your wellbeing matters
               </Text>
+
               <Text style={styles.memberFooterSubtitle}>
                 Small steps. Healthier habits.
               </Text>
@@ -259,7 +686,10 @@ export default function ProfileScreen({ user }: Props) {
 
             {memberSince && (
               <View style={styles.memberSince}>
-                <Text style={styles.memberSinceLabel}>MEMBER SINCE</Text>
+                <Text style={styles.memberSinceLabel}>
+                  MEMBER SINCE
+                </Text>
+
                 <Text style={styles.memberSinceValue}>
                   {memberSince}
                 </Text>
@@ -268,23 +698,48 @@ export default function ProfileScreen({ user }: Props) {
           </View>
         </LinearGradient>
 
+        {/* PROFILE LOADING */}
+
+        {loadingProfile && (
+          <View style={styles.profileLoading}>
+            <ActivityIndicator color="#247A4A" />
+
+            <Text style={styles.profileLoadingText}>
+              Loading your profile...
+            </Text>
+          </View>
+        )}
+
         {/* ACCOUNT SECTION */}
+
         <View style={styles.sectionHeader}>
           <View>
-            <Text style={styles.sectionTitle}>Account</Text>
+            <Text style={styles.sectionTitle}>
+              Account
+            </Text>
+
             <Text style={styles.sectionSubtitle}>
               Your account information
             </Text>
           </View>
 
           <View style={styles.sectionIcon}>
-            <UserRound size={18} color="#247A4A" />
+            <UserRound
+              size={18}
+              color="#247A4A"
+            />
           </View>
         </View>
 
         <View style={styles.optionsGroup}>
           <ProfileOption
-            icon={<Mail size={21} color="#247A4A" strokeWidth={1.9} />}
+            icon={
+              <Mail
+                size={21}
+                color="#247A4A"
+                strokeWidth={1.9}
+              />
+            }
             title="Email address"
             description={email}
             showArrow={false}
@@ -293,35 +748,57 @@ export default function ProfileScreen({ user }: Props) {
           <View style={styles.cardDivider} />
 
           <ProfileOption
-            icon={<Leaf size={21} color="#247A4A" strokeWidth={1.9} />}
+            icon={
+              <Leaf
+                size={21}
+                color="#247A4A"
+                strokeWidth={1.9}
+              />
+            }
             title="Wellness journey"
-            description="Build healthy habits at your own pace"
+            description={
+              profile?.wellness_goal?.trim() ||
+              "Build healthy habits at your own pace"
+            }
             showArrow={false}
           />
         </View>
 
-        {/* PREFERENCES SECTION */}
+        {/* PREFERENCES AND PRIVACY */}
+
         <View style={styles.sectionHeader}>
           <View>
-            <Text style={styles.sectionTitle}>Preferences & Privacy</Text>
+            <Text style={styles.sectionTitle}>
+              Preferences & Privacy
+            </Text>
+
             <Text style={styles.sectionSubtitle}>
               Your comfort and peace of mind
             </Text>
           </View>
 
           <View style={styles.sectionIcon}>
-            <ShieldCheck size={18} color="#247A4A" />
+            <ShieldCheck
+              size={18}
+              color="#247A4A"
+            />
           </View>
         </View>
 
         <View style={styles.optionsGroup}>
           <ProfileOption
-            icon={<Bell size={21} color="#B77A25" strokeWidth={1.9} />}
+            icon={
+              <Bell
+                size={21}
+                color="#B77A25"
+                strokeWidth={1.9}
+              />
+            }
             backgroundColor="#FFF3DF"
-            iconColor="#B77A25"
             title="Notifications"
-            description="Wellness reminders and updates"
-            showArrow={false}
+            description="Manage your wellness reminders and updates"
+            showArrow={true}
+            onPress={handleOpenNotifications}
           />
 
           <View style={styles.cardDivider} />
@@ -335,7 +812,6 @@ export default function ProfileScreen({ user }: Props) {
               />
             }
             backgroundColor="#EAF0FF"
-            iconColor="#5475BB"
             title="Privacy & security"
             description="Your wellness information deserves care"
             showArrow={false}
@@ -343,6 +819,7 @@ export default function ProfileScreen({ user }: Props) {
         </View>
 
         {/* WELLNESS MESSAGE */}
+
         <LinearGradient
           colors={["#E7F5EC", "#F0F8F2"]}
           start={{ x: 0, y: 0 }}
@@ -350,13 +827,18 @@ export default function ProfileScreen({ user }: Props) {
           style={styles.wellnessNote}
         >
           <View style={styles.wellnessNoteIcon}>
-            <Heart size={21} color="#247A4A" strokeWidth={1.9} />
+            <Heart
+              size={21}
+              color="#247A4A"
+              strokeWidth={1.9}
+            />
           </View>
 
           <View style={styles.wellnessNoteContent}>
             <Text style={styles.wellnessNoteTitle}>
               Take a moment for yourself
             </Text>
+
             <Text style={styles.wellnessNoteText}>
               Rest is productive, progress takes time, and every small
               step counts.
@@ -365,6 +847,7 @@ export default function ProfileScreen({ user }: Props) {
         </LinearGradient>
 
         {/* LOGOUT */}
+
         <TouchableOpacity
           style={styles.logoutButton}
           onPress={handleLogout}
@@ -380,10 +863,19 @@ export default function ProfileScreen({ user }: Props) {
             />
           </View>
 
-          <Text style={styles.logoutText}>Log Out</Text>
+          <Text style={styles.logoutText}>
+            Log Out
+          </Text>
+
           <View style={styles.logoutSpacer} />
-          <ChevronRight size={19} color="#D38A8A" />
+
+          <ChevronRight
+            size={19}
+            color="#D38A8A"
+          />
         </TouchableOpacity>
+
+        {/* FOOTER */}
 
         <Text style={styles.footerText}>
           WELLNESS AI · YOUR JOURNEY, YOUR PACE
@@ -393,21 +885,36 @@ export default function ProfileScreen({ user }: Props) {
   );
 }
 
+// ============================================================
+// STYLES
+// ============================================================
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: "#F4F8F5",
   },
 
+  scrollView: {
+    flex: 1,
+  },
+
   content: {
     paddingHorizontal: 20,
   },
+
+  // PAGE HEADER
 
   pageHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     marginBottom: 25,
+  },
+
+  pageHeaderText: {
+    flex: 1,
+    paddingRight: 12,
   },
 
   eyebrow: {
@@ -442,6 +949,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+
+  // PROFILE HERO
 
   profileHero: {
     borderRadius: 27,
@@ -484,6 +993,8 @@ const styles = StyleSheet.create({
     marginBottom: 19,
   },
 
+  // AVATAR
+
   avatarOuter: {
     position: "relative",
   },
@@ -496,6 +1007,13 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderWidth: 3,
     borderColor: "rgba(255,255,255,0.3)",
+    overflow: "hidden",
+  },
+
+  avatarImage: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 24,
   },
 
   avatarText: {
@@ -504,17 +1022,55 @@ const styles = StyleSheet.create({
     color: "#247A4A",
   },
 
+  cameraButton: {
+    position: "absolute",
+    right: -5,
+    bottom: -5,
+    width: 31,
+    height: 31,
+    borderRadius: 16,
+    backgroundColor: "#247A4A",
+    borderWidth: 3,
+    borderColor: "#216B44",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 5,
+  },
+
   onlineIndicator: {
     position: "absolute",
     right: -3,
-    bottom: -3,
-    width: 19,
-    height: 19,
-    borderRadius: 10,
+    top: -3,
+    width: 13,
+    height: 13,
+    borderRadius: 7,
     backgroundColor: "#65D99A",
-    borderWidth: 3,
+    borderWidth: 2,
     borderColor: "#216B44",
+    zIndex: 2,
   },
+
+  changePhotoButton: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 13,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 13,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+  },
+
+  changePhotoText: {
+    color: "#E1F6E8",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+
+  // MEMBER BADGE
 
   memberBadge: {
     flexDirection: "row",
@@ -534,6 +1090,8 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
     color: "#E1F6E8",
   },
+
+  // PROFILE DETAILS
 
   profileName: {
     fontSize: 24,
@@ -561,6 +1119,8 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255,255,255,0.18)",
     marginVertical: 21,
   },
+
+  // MEMBER FOOTER
 
   memberFooter: {
     flexDirection: "row",
@@ -612,6 +1172,21 @@ const styles = StyleSheet.create({
     marginTop: 5,
   },
 
+  profileLoading: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    marginBottom: 20,
+  },
+
+  profileLoadingText: {
+    color: "#829087",
+    fontSize: 12,
+  },
+
+  // SECTION HEADERS
+
   sectionHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -640,6 +1215,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+
+  // OPTION GROUPS
 
   optionsGroup: {
     backgroundColor: "#FFFFFF",
@@ -695,6 +1272,8 @@ const styles = StyleSheet.create({
     marginLeft: 59,
   },
 
+  // WELLNESS NOTE
+
   wellnessNote: {
     flexDirection: "row",
     alignItems: "center",
@@ -732,6 +1311,8 @@ const styles = StyleSheet.create({
     marginTop: 5,
   },
 
+  // LOGOUT
+
   logoutButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -762,6 +1343,8 @@ const styles = StyleSheet.create({
   logoutSpacer: {
     flex: 1,
   },
+
+  // FOOTER
 
   footerText: {
     fontSize: 9,

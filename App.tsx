@@ -1,4 +1,5 @@
 // App.tsx
+
 import React, {
   memo,
   useCallback,
@@ -12,7 +13,10 @@ import {
   View,
 } from "react-native";
 
-import { SafeAreaProvider } from "react-native-safe-area-context";
+import {
+  SafeAreaProvider,
+  useSafeAreaInsets,
+} from "react-native-safe-area-context";
 
 import {
   initializeDatabase,
@@ -29,6 +33,11 @@ import ProfileScreen from "./src/screens/ProfileScreen";
 
 import BottomNavigation from "./src/components/BottomNavigation";
 import FloatingChatbot from "./src/components/FloatingChatbot";
+
+import {
+  ScreenLayoutProvider,
+  type ScreenLayout,
+} from "./src/context/ScreenLayoutContext";
 
 // ============================================================================
 // TYPES
@@ -51,10 +60,6 @@ type AppSession = Awaited<
   ReturnType<typeof supabase.auth.getSession>
 >["data"]["session"];
 
-type ScreenProps = {
-  user: NonNullable<AppSession>["user"];
-};
-
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -62,6 +67,17 @@ type ScreenProps = {
 export const TAB_BAR_HEIGHT = 72;
 
 const CHATBOT_GAP = 24;
+
+export const SCREEN_BOTTOM_GAP = 24;
+export const SCREEN_HORIZONTAL_PADDING = 20;
+
+// Only the additional spacing below the status bar.
+// Do not add insets.top here because the screen is already
+// laid out below the status bar on Android.
+export const SCREEN_TOP_GAP = 8;
+
+const APP_BACKGROUND = "#F5FAF7";
+const PRIMARY_GREEN = "#247A4A";
 
 const INITIAL_VISITED_SCREENS: VisitedScreens = {
   home: true,
@@ -74,19 +90,28 @@ const INITIAL_VISITED_SCREENS: VisitedScreens = {
 // MEMOIZED SCREENS
 // ============================================================================
 
-// React.memo prevents a screen from re-rendering when its props have not
-// changed. This is particularly useful when another screen becomes active.
-
 const MemoWellnessHome = memo(WellnessHome);
 const MemoExerciseScreen = memo(ExerciseScreen);
 const MemoProgressScreen = memo(ProgressScreen);
 const MemoProfileScreen = memo(ProfileScreen);
 
 // ============================================================================
-// APP
+// APP ROOT
 // ============================================================================
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
+  );
+}
+
+// ============================================================================
+// APP CONTENT
+// ============================================================================
+
+function AppContent() {
   const [appReady, setAppReady] = useState(false);
   const [databaseReady, setDatabaseReady] = useState(false);
 
@@ -95,9 +120,9 @@ export default function App() {
 
   const [session, setSession] = useState<AppSession>(null);
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // DATABASE INITIALIZATION
-  // --------------------------------------------------------------------------
+  // ==========================================================================
 
   useEffect(() => {
     let mounted = true;
@@ -110,7 +135,6 @@ export default function App() {
 
         console.log("[App] SQLite initialization completed");
 
-        // Inspect the schema only after initialization succeeds.
         inspectDatabaseSchema();
 
         if (mounted) {
@@ -139,19 +163,17 @@ export default function App() {
     };
   }, []);
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // AUTHENTICATION
-  // --------------------------------------------------------------------------
+  // ==========================================================================
 
   useEffect(() => {
     let mounted = true;
 
     async function initializeAuth() {
       try {
-        const {
-          data,
-          error,
-        } = await supabase.auth.getSession();
+        const { data, error } =
+          await supabase.auth.getSession();
 
         if (error) {
           throw error;
@@ -211,16 +233,14 @@ export default function App() {
     };
   }, []);
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // APPLICATION GATE
-  // --------------------------------------------------------------------------
+  // ==========================================================================
 
   if (!appReady || authStatus === "initializing") {
     return <AppLoadingScreen />;
   }
 
-  // Keep authentication accessible if SQLite fails to initialize.
-  // Database-dependent features should handle database errors themselves.
   if (authStatus === "unauthenticated" || !session?.user) {
     return <UnauthenticatedApp />;
   }
@@ -239,14 +259,12 @@ export default function App() {
 
 function AppLoadingScreen() {
   return (
-    <SafeAreaProvider>
-      <View style={styles.loadingScreen}>
-        <ActivityIndicator
-          size="large"
-          color="#247A4A"
-        />
-      </View>
-    </SafeAreaProvider>
+    <View style={styles.loadingScreen}>
+      <ActivityIndicator
+        size="large"
+        color={PRIMARY_GREEN}
+      />
+    </View>
   );
 }
 
@@ -256,18 +274,13 @@ function AppLoadingScreen() {
 
 function UnauthenticatedApp() {
   const handleLogin = useCallback((sessionData: unknown) => {
-    // The Supabase auth-state listener manages the actual session.
     console.log(
       "[Auth] Login callback received:",
       Boolean(sessionData),
     );
   }, []);
 
-  return (
-    <SafeAreaProvider>
-      <LoginScreen onLogin={handleLogin} />
-    </SafeAreaProvider>
-  );
+  return <LoginScreen onLogin={handleLogin} />;
 }
 
 // ============================================================================
@@ -283,9 +296,11 @@ function AuthenticatedApp({
 }) {
   const user = session.user;
 
-  // --------------------------------------------------------------------------
+  const insets = useSafeAreaInsets();
+
+  // ==========================================================================
   // NAVIGATION STATE
-  // --------------------------------------------------------------------------
+  // ==========================================================================
 
   const [currentScreen, setCurrentScreen] =
     useState<ScreenKey>("home");
@@ -293,7 +308,6 @@ function AuthenticatedApp({
   const [visitedScreens, setVisitedScreens] =
     useState<VisitedScreens>(INITIAL_VISITED_SCREENS);
 
-  // Update only the state that actually needs to change.
   const navigate = useCallback((screen: ScreenKey) => {
     setCurrentScreen((current) =>
       current === screen ? current : screen,
@@ -311,9 +325,9 @@ function AuthenticatedApp({
     });
   }, []);
 
-  // --------------------------------------------------------------------------
-  // STABLE HOME CALLBACKS
-  // --------------------------------------------------------------------------
+  // ==========================================================================
+  // HOME CALLBACKS
+  // ==========================================================================
 
   const openExercise = useCallback(() => {
     navigate("exercise");
@@ -327,9 +341,9 @@ function AuthenticatedApp({
     navigate("profile");
   }, [navigate]);
 
-  // --------------------------------------------------------------------------
-  // TAB BAR
-  // --------------------------------------------------------------------------
+  // ==========================================================================
+  // BOTTOM NAVIGATION MEASUREMENT
+  // ==========================================================================
 
   const [tabBarHeight, setTabBarHeight] =
     useState(TAB_BAR_HEIGHT);
@@ -351,6 +365,10 @@ function AuthenticatedApp({
     [],
   );
 
+  // ==========================================================================
+  // SCREEN NAVIGATION
+  // ==========================================================================
+
   const handleNavigate = useCallback(
     (screen: string) => {
       if (isScreenKey(screen)) {
@@ -360,16 +378,36 @@ function AuthenticatedApp({
     [navigate],
   );
 
-  const chatbotBottomOffset = tabBarHeight + CHATBOT_GAP;
+  // ==========================================================================
+  // SHARED SCREEN LAYOUT
+  // ==========================================================================
 
-  // --------------------------------------------------------------------------
+  const screenLayout: ScreenLayout = {
+  // Match the top spacing used by WellnessHome.
+  topPadding: insets.top + SCREEN_TOP_GAP,
+
+  horizontalPadding: SCREEN_HORIZONTAL_PADDING,
+
+  bottomPadding: tabBarHeight + SCREEN_BOTTOM_GAP,
+
+  bottomNavigationHeight: tabBarHeight,
+};
+
+  // ==========================================================================
+  // CHATBOT POSITIONING
+  // ==========================================================================
+
+  const chatbotBottomOffset =
+    Math.max(0, tabBarHeight - insets.bottom) + CHATBOT_GAP;
+
+  // ==========================================================================
   // RENDER
-  // --------------------------------------------------------------------------
+  // ==========================================================================
 
   return (
-    <SafeAreaProvider>
+    <ScreenLayoutProvider value={screenLayout}>
       <View style={styles.container}>
-        {/* Screen container */}
+        {/* SCREEN HOST */}
 
         <View style={styles.screenHost}>
           {visitedScreens.home && (
@@ -405,7 +443,7 @@ function AuthenticatedApp({
           )}
         </View>
 
-        {/* Persistent bottom navigation */}
+        {/* PERSISTENT BOTTOM NAVIGATION */}
 
         <BottomNavigation
           currentScreen={currentScreen}
@@ -413,13 +451,13 @@ function AuthenticatedApp({
           onHeightChange={handleTabBarHeightChange}
         />
 
-        {/* Persistent chatbot */}
+        {/* PERSISTENT CHATBOT */}
 
         <FloatingChatbot
           bottomOffset={chatbotBottomOffset}
         />
 
-        {/* Small offline/database warning indicator */}
+        {/* DATABASE WARNING */}
 
         {!databaseReady && (
           <View
@@ -430,7 +468,7 @@ function AuthenticatedApp({
           </View>
         )}
       </View>
-    </SafeAreaProvider>
+    </ScreenLayoutProvider>
   );
 }
 
@@ -483,7 +521,7 @@ function isScreenKey(value: unknown): value is ScreenKey {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#F5FAF7",
+    backgroundColor: APP_BACKGROUND,
   },
 
   screenHost: {
@@ -495,7 +533,7 @@ const styles = StyleSheet.create({
   },
 
   slotHidden: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     opacity: 0,
   },
 
@@ -503,7 +541,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F5FAF7",
+    backgroundColor: APP_BACKGROUND,
   },
 
   databaseWarning: {
@@ -523,6 +561,8 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
 });
+
+
 
 //  npx react-native run-android
 
