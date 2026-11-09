@@ -1,16 +1,44 @@
 // src/components/AudioPlayer.tsx
-import React, { useEffect, useRef, useState } from "react";
+
+import React, {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   Alert,
+  Image,
+  ScrollView,
+  StatusBar,
+  ActivityIndicator,
+  AppState,
 } from "react-native";
 import Sound from "react-native-sound";
+import LinearGradient from "react-native-linear-gradient";
+import {
+  ArrowLeft,
+  Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  Music2,
+  Headphones,
+  Leaf,
+  Sparkles,
+  Check,
+  Clock3,
+  Repeat2,
+  ListMusic,
+} from "lucide-react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { supabase } from "../lib/supabase";
 
-// Enable playback in silent mode on iOS
+// Enable playback in silent mode on iOS.
 Sound.setCategory("Playback");
 
 type Track = {
@@ -26,245 +54,1199 @@ type Track = {
 
 type Props = {
   user: any;
-  exercise: { id: string; title: string; category: string; type: string };
+  exercise: {
+    id: string;
+    title: string;
+    category: string;
+    type: string;
+  };
   tracks: Track[];
   onClose: (completed: boolean) => void;
 };
 
-export default function AudioPlayer({ user, exercise, tracks, onClose }: Props) {
+export default function AudioPlayer({
+  user,
+  exercise,
+  tracks,
+  onClose,
+}: Props) {
+  const insets = useSafeAreaInsets();
+
   const soundRef = useRef<Sound | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appStateRef = useRef(AppState.currentState);
+  const mountedRef = useRef(true);
+  const savingRef = useRef(false);
+  const finishedRef = useRef(false);
+  const sessionIdRef = useRef<string | null>(null);
+  const sessionPromiseRef = useRef<Promise<string | null> | null>(null);
+  const elapsedRef = useRef(0);
+  const lastPositionRef = useRef(0);
+
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
 
   const current = tracks[index];
 
-  // Create session row
+  const stopTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  const pauseAudio = useCallback(() => {
+    stopTimer();
+    soundRef.current?.pause();
+
+    if (mountedRef.current) {
+      setPlaying(false);
+    }
+  }, [stopTimer]);
+
+  const releaseSound = useCallback(() => {
+    stopTimer();
+
+    const sound = soundRef.current;
+    soundRef.current = null;
+
+    if (sound) {
+      sound.stop(() => {
+        sound.release();
+      });
+    }
+  }, [stopTimer]);
+
+  const formatTime = (value: number) => {
+    const safeValue = Math.max(0, Math.floor(value));
+    const mins = Math.floor(safeValue / 60);
+    const secs = safeValue % 60;
+
+    return `${mins}:${String(secs).padStart(2, "0")}`;
+  };
+
+  // Create one session record for this listening session.
   useEffect(() => {
-    (async () => {
-      const { data } = await supabase
-        .from("wellness_sessions")
-        .insert({
-          user_id: user.id,
-          exercise_id: exercise.id,
-          session_type: "music",
-          category: exercise.category,
-          completed: false,
-          metadata: { source: "audio_player" },
-        })
-        .select()
-        .single();
-      if (data) setSessionId(data.id);
+    mountedRef.current = true;
+
+    sessionPromiseRef.current = (async () => {
+      if (!user?.id) {
+        return null;
+      }
+
+      try {
+        const { data, error } = await supabase
+          .from("wellness_sessions")
+          .insert({
+            user_id: user.id,
+            exercise_id: exercise.id,
+            session_type: "music",
+            category: exercise.category,
+            completed: false,
+            duration_seconds: 0,
+            started_at: new Date().toISOString(),
+            metadata: {
+              source: "audio_player",
+              exercise_title: exercise.title,
+              track_count: tracks.length,
+            },
+          })
+          .select("id")
+          .single();
+
+        if (error) {
+          console.warn("[AudioPlayer] Session creation failed:", error.message);
+          return null;
+        }
+
+        sessionIdRef.current = data.id;
+
+        if (mountedRef.current) {
+          setSessionReady(true);
+        }
+
+        return data.id as string;
+      } catch (error) {
+        console.warn("[AudioPlayer] Session creation error:", error);
+        return null;
+      }
     })();
 
     return () => {
-      soundRef.current?.release();
-      if (timerRef.current) clearInterval(timerRef.current);
+      mountedRef.current = false;
+      stopTimer();
+
+      const sound = soundRef.current;
+      soundRef.current = null;
+
+      if (sound) {
+        sound.stop(() => sound.release());
+      }
     };
-  }, []);
+  }, [user?.id, exercise.id, exercise.category, exercise.title, tracks.length, stopTimer]);
 
-  // Load current track
-  useEffect(() => {
-    if (!current) return;
-    let cancelled = false;
-
-    soundRef.current?.release();
-
-    const sound = new Sound(current.source_url, "", (error) => {
-      if (cancelled) return;
-      if (error) {
-        Alert.alert("Playback error", "Couldn't load the audio.");
+  const finishSession = useCallback(
+    async (completed: boolean) => {
+      if (savingRef.current || finishedRef.current) {
         return;
       }
-      setDuration(sound.getDuration());
-      if (current.autoplay ?? true) {
-        sound.play((success) => {
-          if (!success) return;
-          // Track finished
-          if (index < tracks.length - 1) setIndex((i) => i + 1);
-          else finishSession(true);
+
+      if (!user?.id) {
+        Alert.alert(
+          "Sign in required",
+          "Please sign in before saving your listening session."
+        );
+        return;
+      }
+
+      savingRef.current = true;
+      setSaving(true);
+
+      pauseAudio();
+
+      try {
+        // Wait for session creation to finish before attempting an update.
+        const sessionId = sessionIdRef.current ??
+          (sessionPromiseRef.current
+            ? await sessionPromiseRef.current
+            : null);
+
+        if (!sessionId) {
+          throw new Error(
+            "Your listening session could not be created. Please check your connection and try again."
+          );
+        }
+
+        const elapsed = Math.max(0, Math.floor(elapsedRef.current));
+
+        const { error: sessionError } = await supabase
+          .from("wellness_sessions")
+          .update({
+            completed,
+            duration_seconds: elapsed,
+            completed_at: completed ? new Date().toISOString() : null,
+            metadata: {
+              source: "audio_player",
+              exercise_title: exercise.title,
+              track_count: tracks.length,
+              last_track_title: current?.title ?? null,
+            },
+          })
+          .eq("id", sessionId)
+          .eq("user_id", user.id);
+
+        if (sessionError) {
+          throw sessionError;
+        }
+
+        if (completed) {
+          const { error: activityError } = await supabase
+            .from("daily_activities")
+            .insert({
+              user_id: user.id,
+              activity_type: exercise.category || "Music",
+              duration_minutes: Math.max(1, Math.round(elapsed / 60)),
+              completed: true,
+            });
+
+          if (activityError) {
+            // The session itself has already been saved. Don't mark it
+            // as failed or retry it automatically, which could duplicate it.
+            console.warn(
+              "[AudioPlayer] Daily activity logging failed:",
+              activityError.message
+            );
+          }
+        }
+
+        finishedRef.current = true;
+
+        if (mountedRef.current) {
+          onClose(completed);
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while saving your session.";
+
+        Alert.alert("Unable to save session", message);
+      } finally {
+        savingRef.current = false;
+
+        if (mountedRef.current) {
+          setSaving(false);
+        }
+      }
+    },
+    [user?.id, exercise, tracks.length, current?.title, pauseAudio, onClose]
+  );
+
+  const playTrack = useCallback(
+    (sound: Sound) => {
+      if (savingRef.current || finishedRef.current) {
+        return;
+      }
+
+      stopTimer();
+
+      sound.play((success) => {
+        if (!mountedRef.current || finishedRef.current) {
+          return;
+        }
+
+        stopTimer();
+
+        if (!success) {
+          setPlaying(false);
+          return;
+        }
+
+        // A looping track should not advance automatically.
+        if (current?.loop) {
+          return;
+        }
+
+        if (index < tracks.length - 1) {
+          setIndex((previous) => previous + 1);
+        } else {
+          void finishSession(true);
+        }
+      });
+
+      setPlaying(true);
+
+      timerRef.current = setInterval(() => {
+        if (appStateRef.current !== "active") {
+          return;
+        }
+
+        sound.getCurrentTime((seconds) => {
+          if (!mountedRef.current) {
+            return;
+          }
+
+          const nextPosition = Math.max(0, seconds);
+          const previousPosition = lastPositionRef.current;
+
+          // Count forward playback only. This avoids counting a seek
+          // backwards as negative listening time.
+          if (nextPosition >= previousPosition) {
+            elapsedRef.current += nextPosition - previousPosition;
+          }
+
+          lastPositionRef.current = nextPosition;
+          setPosition(nextPosition);
         });
-        setPlaying(true);
+      }, 500);
+    },
+    [stopTimer, current?.loop, index, tracks.length, finishSession]
+  );
+
+  // Load a new track whenever the selected track changes.
+  useEffect(() => {
+    if (!current) {
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    stopTimer();
+
+    const oldSound = soundRef.current;
+    soundRef.current = null;
+
+    if (oldSound) {
+      oldSound.stop(() => oldSound.release());
+    }
+
+    setPlaying(false);
+    setPosition(0);
+    setDuration(0);
+    setLoading(true);
+    lastPositionRef.current = 0;
+
+    const sound = new Sound(current.source_url, "", (error) => {
+      if (cancelled) {
+        sound.release();
+        return;
+      }
+
+      if (error) {
+        setLoading(false);
+        setPlaying(false);
+
+        Alert.alert(
+          "Playback error",
+          `Couldn't load "${current.title}". Check the audio URL and your connection.`,
+          [{ text: "OK" }]
+        );
+        return;
+      }
+
+      soundRef.current = sound;
+      setDuration(sound.getDuration());
+      setLoading(false);
+
+      if (current.autoplay ?? true) {
+        playTrack(sound);
       }
     });
-    sound.setNumberOfLoops(current.loop ? -1 : 0);
-    soundRef.current = sound;
-
-    timerRef.current = setInterval(() => {
-      sound.getCurrentTime((seconds) => setPosition(seconds));
-    }, 500);
 
     return () => {
       cancelled = true;
-      if (timerRef.current) clearInterval(timerRef.current);
-      sound.release();
+      stopTimer();
+
+      if (soundRef.current === sound) {
+        soundRef.current = null;
+      }
+
+      sound.stop(() => sound.release());
     };
-  }, [current?.id]);
+  }, [current?.id, current?.source_url, stopTimer, playTrack]);
 
-  async function togglePlay() {
-    const s = soundRef.current;
-    if (!s) return;
-    if (playing) {
-      s.pause();
-      setPlaying(false);
-    } else {
-      s.play((success) => {
-        if (success) {
-          if (index < tracks.length - 1) setIndex((i) => i + 1);
-          else finishSession(true);
+  // Stop playback when the app enters the background.
+  useEffect(() => {
+    const subscription = AppState.addEventListener(
+      "change",
+      (nextState) => {
+        const wasActive = appStateRef.current === "active";
+        const goingInactive =
+          nextState === "inactive" || nextState === "background";
+
+        if (wasActive && goingInactive) {
+          pauseAudio();
         }
-      });
-      setPlaying(true);
-    }
-  }
 
-  async function next() {
-    if (index < tracks.length - 1) setIndex((i) => i + 1);
-    else finishSession(true);
-  }
+        appStateRef.current = nextState;
+      }
+    );
 
-  async function prev() {
-    if (index > 0) setIndex((i) => i - 1);
-  }
+    return () => subscription.remove();
+  }, [pauseAudio]);
 
-  async function finishSession(completed: boolean) {
-    soundRef.current?.pause();
-    const elapsed = Math.round(position);
-
-    if (sessionId) {
-      await supabase
-        .from("wellness_sessions")
-        .update({
-          completed,
-          duration_seconds: elapsed,
-          completed_at: completed ? new Date().toISOString() : null,
-        })
-        .eq("id", sessionId);
+  const togglePlay = useCallback(() => {
+    if (saving || loading || !soundRef.current || finishedRef.current) {
+      return;
     }
 
-    if (completed) {
-      await supabase.from("daily_activities").insert({
-        user_id: user.id,
-        activity_type: exercise.category ?? "Music",
-        duration_minutes: Math.max(1, Math.round(elapsed / 60)),
-        completed: true,
-      });
+    const sound = soundRef.current;
+
+    if (playing) {
+      pauseAudio();
+    } else {
+      playTrack(sound);
     }
+  }, [saving, loading, playing, pauseAudio, playTrack]);
 
-    onClose(completed);
-  }
+  const changeTrack = useCallback(
+    (nextIndex: number) => {
+      if (
+        saving ||
+        finishedRef.current ||
+        nextIndex < 0 ||
+        nextIndex >= tracks.length
+      ) {
+        return;
+      }
 
-  const fmt = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60);
-    return `${m}:${String(s).padStart(2, "0")}`;
+      setIndex(nextIndex);
+    },
+    [saving, tracks.length]
+  );
+
+  const handleExit = () => {
+    Alert.alert(
+      "End listening session?",
+      "Your listening time will be saved as an incomplete session.",
+      [
+        {
+          text: "Keep listening",
+          style: "cancel",
+        },
+        {
+          text: "Exit session",
+          style: "destructive",
+          onPress: () => {
+            void finishSession(false);
+          },
+        },
+      ]
+    );
   };
 
   if (!current) {
     return (
-      <View style={styles.root}>
-        <Text style={styles.empty}>No tracks available.</Text>
+      <View
+        style={[
+          styles.root,
+          styles.emptyRoot,
+          { paddingTop: insets.top + 24 },
+        ]}
+      >
+        <View style={styles.emptyIcon}>
+          <Music2 size={32} color="#247A4A" />
+        </View>
+        <Text style={styles.emptyTitle}>No tracks available</Text>
+        <Text style={styles.emptyDescription}>
+          There are no audio tracks available for this session yet.
+        </Text>
+        <TouchableOpacity
+          style={styles.emptyButton}
+          onPress={() => onClose(false)}
+          activeOpacity={0.8}
+        >
+          <Text style={styles.emptyButtonText}>Go Back</Text>
+        </TouchableOpacity>
       </View>
     );
   }
 
+  const progress = duration > 0
+    ? Math.min(100, Math.max(0, (position / duration) * 100))
+    : 0;
+
   return (
-    <View style={styles.root}>
+    <View
+      style={[
+        styles.root,
+        { paddingTop: Math.max(insets.top, 8) },
+      ]}
+    >
+      <StatusBar
+        barStyle="dark-content"
+        backgroundColor="#F4F8F5"
+      />
+
+      {/* HEADER */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => finishSession(false)}>
-          <Text style={styles.exit}>✕ Exit</Text>
-        </TouchableOpacity>
-        <Text style={styles.headerTitle} numberOfLines={1}>
-          {exercise.title}
-        </Text>
-        <Text style={styles.counter}>
-          {index + 1}/{tracks.length}
-        </Text>
-      </View>
-
-      <View style={styles.body}>
-        <View style={styles.art} />
-        <Text style={styles.title}>{current.title}</Text>
-        {current.artist ? <Text style={styles.artist}>{current.artist}</Text> : null}
-
-        <View style={styles.seekTrack}>
-          <View
-            style={[
-              styles.seekFill,
-              { width: duration ? `${(position / duration) * 100}%` : "0%" },
-            ]}
-          />
-        </View>
-
-        <View style={styles.timeRow}>
-          <Text style={styles.time}>{fmt(position)}</Text>
-          <Text style={styles.time}>{fmt(duration)}</Text>
-        </View>
-
-        <View style={styles.controls}>
-          <TouchableOpacity onPress={prev} style={styles.ctrlSmall}>
-            <Text style={styles.ctrlSmallText}>⏮</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity onPress={togglePlay} style={styles.ctrlBig}>
-            <Text style={styles.ctrlBigText}>{playing ? "⏸" : "▶"}</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity onPress={next} style={styles.ctrlSmall}>
-            <Text style={styles.ctrlSmallText}>⏭</Text>
-          </TouchableOpacity>
-        </View>
-
         <TouchableOpacity
-          style={styles.finish}
-          onPress={() => finishSession(true)}
+          onPress={handleExit}
+          style={styles.backButton}
+          activeOpacity={0.75}
+          accessibilityRole="button"
+          accessibilityLabel="Exit audio player"
         >
-          <Text style={styles.finishText}>Finish session</Text>
+          <ArrowLeft size={21} color="#294436" />
         </TouchableOpacity>
+
+        <View style={styles.headerText}>
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            {exercise.title}
+          </Text>
+          <Text style={styles.headerSubtitle}>A MOMENT FOR YOU</Text>
+        </View>
+
+        <View style={styles.trackCounter}>
+          <ListMusic size={15} color="#247A4A" />
+          <Text style={styles.counterText}>
+            {index + 1}/{tracks.length}
+          </Text>
+        </View>
       </View>
+
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={[
+          styles.content,
+          { paddingBottom: Math.max(insets.bottom, 12) + 28 },
+        ]}
+      >
+        {/* INTRO */}
+        <View style={styles.introRow}>
+          <View style={styles.introIcon}>
+            <Sparkles size={18} color="#247A4A" />
+          </View>
+          <View style={styles.introText}>
+            <Text style={styles.introTitle}>Find your calm</Text>
+            <Text style={styles.introSubtitle}>
+              Unwind, focus, and reconnect with yourself.
+            </Text>
+          </View>
+          <Leaf size={24} color="#8AB99A" />
+        </View>
+
+        {/* ALBUM ART */}
+        <LinearGradient
+          colors={["#D9F0E1", "#B9DFC8", "#EAF6EE"]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.artworkCard}
+        >
+          <View style={styles.artDecorationOne} />
+          <View style={styles.artDecorationTwo} />
+
+          {current.thumbnail_url ? (
+            <Image
+              source={{ uri: current.thumbnail_url }}
+              style={styles.artworkImage}
+              resizeMode="cover"
+            />
+          ) : (
+            <View style={styles.artworkFallback}>
+              <LinearGradient
+                colors={["#2D8655", "#195B3A"]}
+                style={styles.artworkDisc}
+              >
+                <View style={styles.discRing}>
+                  <View style={styles.discInner}>
+                    <Headphones size={42} color="#FFFFFF" strokeWidth={1.5} />
+                  </View>
+                </View>
+              </LinearGradient>
+              <View style={styles.artworkSparkle}>
+                <Sparkles size={22} color="#247A4A" />
+              </View>
+            </View>
+          )}
+
+          <View style={styles.artworkLabel}>
+            <Music2 size={12} color="#FFFFFF" />
+            <Text style={styles.artworkLabelText}>WELLNESS AUDIO</Text>
+          </View>
+        </LinearGradient>
+
+        {/* TRACK DETAILS */}
+        <View style={styles.trackDetails}>
+          <Text style={styles.trackTitle} numberOfLines={2}>
+            {current.title}
+          </Text>
+
+          <Text style={styles.trackArtist} numberOfLines={1}>
+            {current.artist || "Wellness AI • Mindful listening"}
+          </Text>
+
+          <View style={styles.trackTags}>
+            <View style={styles.tag}>
+              <Leaf size={12} color="#4D8962" />
+              <Text style={styles.tagText}>
+                {exercise.category || "Wellness"}
+              </Text>
+            </View>
+
+            {current.loop && (
+              <View style={styles.tag}>
+                <Repeat2 size={12} color="#4D8962" />
+                <Text style={styles.tagText}>Loop enabled</Text>
+              </View>
+            )}
+          </View>
+        </View>
+
+        {/* SEEK BAR */}
+        <View style={styles.seekSection}>
+          <View style={styles.seekTrack}>
+            <View
+              style={[
+                styles.seekFill,
+                { width: `${progress}%` },
+              ]}
+            />
+            <View
+              style={[
+                styles.seekThumb,
+                { left: `${progress}%` },
+              ]}
+            />
+          </View>
+
+          <View style={styles.timeRow}>
+            <Text style={styles.timeText}>{formatTime(position)}</Text>
+            <Text style={styles.timeText}>
+              {formatTime(duration || current.duration_seconds || 0)}
+            </Text>
+          </View>
+        </View>
+
+        {/* PLAYBACK CONTROLS */}
+        <View style={styles.controls}>
+          <TouchableOpacity
+            onPress={() => changeTrack(index - 1)}
+            disabled={index === 0 || saving}
+            style={[
+              styles.sideControl,
+              (index === 0 || saving) && styles.controlDisabled,
+            ]}
+            activeOpacity={0.75}
+            accessibilityRole="button"
+            accessibilityLabel="Previous track"
+          >
+            <SkipBack size={23} color="#315C40" fill="#315C40" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={togglePlay}
+            disabled={loading || saving}
+            style={[
+              styles.playButton,
+              (loading || saving) && styles.controlDisabled,
+            ]}
+            activeOpacity={0.85}
+            accessibilityRole="button"
+            accessibilityLabel={playing ? "Pause audio" : "Play audio"}
+          >
+            <LinearGradient
+              colors={["#2C8552", "#17613B"]}
+              style={styles.playButtonGradient}
+            >
+              {loading ? (
+                <ActivityIndicator color="#FFFFFF" size="small" />
+              ) : playing ? (
+                <Pause size={29} color="#FFFFFF" fill="#FFFFFF" />
+              ) : (
+                <Play size={29} color="#FFFFFF" fill="#FFFFFF" />
+              )}
+            </LinearGradient>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => changeTrack(index + 1)}
+            disabled={index >= tracks.length - 1 || saving}
+            style={[
+              styles.sideControl,
+              (index >= tracks.length - 1 || saving) &&
+                styles.controlDisabled,
+            ]}
+            activeOpacity={0.75}
+            accessibilityRole="button"
+            accessibilityLabel="Next track"
+          >
+            <SkipForward size={23} color="#315C40" fill="#315C40" />
+          </TouchableOpacity>
+        </View>
+
+        <Text style={styles.playbackHint}>
+          {loading
+            ? "Preparing your audio..."
+            : playing
+              ? "Playing • Take a deep breath"
+              : "Paused • Continue whenever you're ready"}
+        </Text>
+
+        {/* SESSION SUMMARY */}
+        <View style={styles.sessionCard}>
+          <View style={styles.sessionIcon}>
+            <Clock3 size={19} color="#247A4A" />
+          </View>
+
+          <View style={styles.sessionText}>
+            <Text style={styles.sessionTitle}>Your listening session</Text>
+            <Text style={styles.sessionSubtitle}>
+              Time spent listening to your audio
+            </Text>
+          </View>
+
+          <Text style={styles.sessionTime}>
+            {formatTime(elapsedRef.current)}
+          </Text>
+        </View>
+
+        {/* FINISH */}
+        <TouchableOpacity
+          style={[
+            styles.finishButton,
+            saving && styles.controlDisabled,
+          ]}
+          onPress={() => void finishSession(true)}
+          disabled={saving || !sessionReady}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          accessibilityLabel="Finish and save listening session"
+        >
+          {saving ? (
+            <ActivityIndicator size="small" color="#FFFFFF" />
+          ) : (
+            <Check size={19} color="#FFFFFF" strokeWidth={2.5} />
+          )}
+
+          <Text style={styles.finishButtonText}>
+            {saving
+              ? "Saving your session..."
+              : !sessionReady
+                ? "Preparing session..."
+                : "Finish & Save Session"}
+          </Text>
+        </TouchableOpacity>
+
+        <View style={styles.privacyNote}>
+          <Leaf size={15} color="#7D9B87" />
+          <Text style={styles.privacyText}>
+            Every moment you give yourself counts.
+          </Text>
+        </View>
+      </ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#F5FAF7" },
-  empty: { textAlign: "center", marginTop: 60, color: "#8A958E" },
+  root: {
+    flex: 1,
+    backgroundColor: "#F4F8F5",
+  },
+
+  emptyRoot: {
+    alignItems: "center",
+    paddingHorizontal: 30,
+  },
+
+  emptyIcon: {
+    width: 76,
+    height: 76,
+    borderRadius: 25,
+    backgroundColor: "#E5F3E9",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 20,
+  },
+
+  emptyTitle: {
+    fontSize: 21,
+    fontWeight: "800",
+    color: "#293D31",
+  },
+
+  emptyDescription: {
+    fontSize: 13,
+    lineHeight: 20,
+    textAlign: "center",
+    color: "#829087",
+    marginTop: 9,
+  },
+
+  emptyButton: {
+    marginTop: 23,
+    paddingHorizontal: 28,
+    paddingVertical: 13,
+    backgroundColor: "#247A4A",
+    borderRadius: 15,
+  },
+
+  emptyButtonText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+
   header: {
     flexDirection: "row",
     alignItems: "center",
+    paddingHorizontal: 19,
+    paddingTop: 8,
+    paddingBottom: 17,
+  },
+
+  backButton: {
+    width: 43,
+    height: 43,
+    borderRadius: 15,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E3ECE5",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  headerText: {
+    flex: 1,
+    marginHorizontal: 12,
+  },
+
+  headerTitle: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#293D31",
+  },
+
+  headerSubtitle: {
+    fontSize: 9,
+    fontWeight: "800",
+    letterSpacing: 1.4,
+    color: "#7D9885",
+    marginTop: 4,
+  },
+
+  trackCounter: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "#E6F3E9",
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderRadius: 13,
+  },
+
+  counterText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#247A4A",
+  },
+
+  content: {
+    paddingHorizontal: 20,
+  },
+
+  introRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 22,
+  },
+
+  introIcon: {
+    width: 41,
+    height: 41,
+    borderRadius: 14,
+    backgroundColor: "#E3F2E7",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 11,
+  },
+
+  introText: {
+    flex: 1,
+  },
+
+  introTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#2B4936",
+  },
+
+  introSubtitle: {
+    fontSize: 11,
+    color: "#87958B",
+    marginTop: 4,
+  },
+
+  artworkCard: {
+    width: "100%",
+    aspectRatio: 1.12,
+    borderRadius: 27,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
+    marginBottom: 23,
+    borderWidth: 1,
+    borderColor: "#D1E7D8",
+  },
+
+  artDecorationOne: {
+    position: "absolute",
+    width: 230,
+    height: 230,
+    borderRadius: 115,
+    backgroundColor: "rgba(255,255,255,0.22)",
+    top: -100,
+    right: -70,
+  },
+
+  artDecorationTwo: {
+    position: "absolute",
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    bottom: -80,
+    left: -65,
+  },
+
+  artworkImage: {
+    width: "100%",
+    height: "100%",
+    position: "absolute",
+  },
+
+  artworkFallback: {
+    width: 210,
+    height: 210,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  artworkDisc: {
+    width: 184,
+    height: 184,
+    borderRadius: 92,
+    alignItems: "center",
+    justifyContent: "center",
+    elevation: 8,
+    shadowColor: "#164B30",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2,
+    shadowRadius: 15,
+  },
+
+  discRing: {
+    width: 144,
+    height: 144,
+    borderRadius: 72,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.3)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  discInner: {
+    width: 94,
+    height: 94,
+    borderRadius: 47,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  artworkSparkle: {
+    position: "absolute",
+    right: 12,
+    top: 23,
+    width: 43,
+    height: 43,
+    borderRadius: 15,
+    backgroundColor: "rgba(255,255,255,0.8)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  artworkLabel: {
+    position: "absolute",
+    left: 15,
+    bottom: 15,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    borderRadius: 13,
+    backgroundColor: "rgba(25,75,47,0.85)",
+  },
+
+  artworkLabelText: {
+    fontSize: 9,
+    fontWeight: "800",
+    letterSpacing: 1.1,
+    color: "#FFFFFF",
+  },
+
+  trackDetails: {
+    alignItems: "center",
+    marginBottom: 25,
+  },
+
+  trackTitle: {
+    fontSize: 22,
+    lineHeight: 29,
+    fontWeight: "800",
+    letterSpacing: -0.5,
+    color: "#263D2F",
+    textAlign: "center",
+  },
+
+  trackArtist: {
+    fontSize: 13,
+    color: "#829087",
+    marginTop: 7,
+  },
+
+  trackTags: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 13,
+  },
+
+  tag: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "#E7F3EA",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 12,
+  },
+
+  tagText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#477857",
+  },
+
+  seekSection: {
+    marginBottom: 20,
+  },
+
+  seekTrack: {
+    height: 6,
+    borderRadius: 5,
+    backgroundColor: "#DFEAE2",
+    overflow: "visible",
+    position: "relative",
+  },
+
+  seekFill: {
+    height: 6,
+    borderRadius: 5,
+    backgroundColor: "#247A4A",
+  },
+
+  seekThumb: {
+    position: "absolute",
+    width: 13,
+    height: 13,
+    borderRadius: 7,
+    backgroundColor: "#247A4A",
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+    top: -3.5,
+    marginLeft: -6.5,
+  },
+
+  timeRow: {
+    flexDirection: "row",
     justifyContent: "space-between",
+    marginTop: 10,
+  },
+
+  timeText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#849187",
+    fontVariant: ["tabular-nums"],
+  },
+
+  controls: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 31,
+    marginTop: 7,
+  },
+
+  sideControl: {
+    width: 53,
+    height: 53,
+    borderRadius: 20,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E4ECE6",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  playButton: {
+    width: 80,
+    height: 80,
+    borderRadius: 29,
+    overflow: "hidden",
+    elevation: 6,
+    shadowColor: "#247A4A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.2,
+    shadowRadius: 10,
+  },
+
+  playButtonGradient: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 29,
+  },
+
+  controlDisabled: {
+    opacity: 0.45,
+  },
+
+  playbackHint: {
+    textAlign: "center",
+    fontSize: 11,
+    color: "#829087",
+    marginTop: 15,
+    marginBottom: 25,
+  },
+
+  sessionCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E5ECE7",
+    borderRadius: 20,
+    padding: 15,
+    marginBottom: 17,
+  },
+
+  sessionIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    backgroundColor: "#E7F4EA",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+
+  sessionText: {
+    flex: 1,
+  },
+
+  sessionTitle: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#304438",
+  },
+
+  sessionSubtitle: {
+    fontSize: 10,
+    color: "#87948B",
+    marginTop: 5,
+  },
+
+  sessionTime: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#247A4A",
+    fontVariant: ["tabular-nums"],
+  },
+
+  finishButton: {
+    minHeight: 56,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    backgroundColor: "#247A4A",
+    borderRadius: 18,
     paddingHorizontal: 16,
-    paddingTop: 50,
-    paddingBottom: 12,
-    backgroundColor: "#FFF",
-    borderBottomWidth: 1,
-    borderBottomColor: "#E7EFEA",
+    elevation: 3,
+    shadowColor: "#247A4A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.14,
+    shadowRadius: 8,
   },
-  exit: { color: "#B02B2B", fontWeight: "700" },
-  headerTitle: { flex: 1, textAlign: "center", fontWeight: "800", color: "#304138" },
-  counter: { color: "#8A958E", fontWeight: "700" },
-  body: { flex: 1, padding: 24, alignItems: "center" },
-  art: { width: 220, height: 220, borderRadius: 28, backgroundColor: "#247A4A", marginBottom: 20 },
-  title: { fontSize: 20, fontWeight: "800", color: "#247A4A", textAlign: "center" },
-  artist: { marginTop: 6, color: "#7A867E" },
-  seekTrack: { height: 4, width: "100%", backgroundColor: "#E1ECE5", borderRadius: 2, marginTop: 30 },
-  seekFill: { height: 4, backgroundColor: "#247A4A", borderRadius: 2 },
-  timeRow: { flexDirection: "row", justifyContent: "space-between", width: "100%", marginTop: 6 },
-  time: { fontSize: 12, color: "#8A958E" },
-  controls: { flexDirection: "row", alignItems: "center", marginTop: 30, gap: 24 },
-  ctrlSmall: {
-    width: 56, height: 56, borderRadius: 28, backgroundColor: "#FFF",
-    alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#E1ECE5",
+
+  finishButtonText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FFFFFF",
   },
-  ctrlSmallText: { fontSize: 22 },
-  ctrlBig: { width: 84, height: 84, borderRadius: 42, backgroundColor: "#247A4A", alignItems: "center", justifyContent: "center" },
-  ctrlBigText: { fontSize: 34, color: "#fff" },
-  finish: {
-    marginTop: 32, backgroundColor: "#EAF6EE", paddingVertical: 14,
-    paddingHorizontal: 28, borderRadius: 18, borderWidth: 1, borderColor: "#C7E3D5",
+
+  privacyNote: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 7,
+    marginTop: 19,
   },
-  finishText: { color: "#247A4A", fontWeight: "800" },
+
+  privacyText: {
+    fontSize: 10,
+    color: "#84968A",
+  },
 });

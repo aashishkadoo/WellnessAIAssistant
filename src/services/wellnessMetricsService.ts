@@ -1,4 +1,6 @@
 //src/services/wellnessMetricsService.ts
+
+
 import { supabase } from "../lib/supabase";
 
 export type WellnessMetrics = {
@@ -35,17 +37,46 @@ export type WellnessMetrics = {
   }>;
 };
 
-export async function fetchWellnessMetrics(userId: string): Promise<WellnessMetrics> {
-  const today = new Date().toISOString().split("T")[0];
+// Use local calendar dates instead of UTC date strings.
+function getLocalDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
 
-  // Week start (last 7 days)
-  const weekAgo = new Date();
-  weekAgo.setDate(weekAgo.getDate() - 6);
-  const weekAgoISO = weekAgo.toISOString();
+  return `${year}-${month}-${day}`;
+}
+
+function getLocalDayBounds(date: Date) {
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  return {
+    startISO: start.toISOString(),
+    endISO: end.toISOString(),
+    dateKey: getLocalDateKey(start),
+  };
+}
+
+export async function fetchWellnessMetrics(
+  userId: string,
+): Promise<WellnessMetrics> {
+  const now = new Date();
+  const today = getLocalDayBounds(now);
+
+  const weekStart = new Date(now);
+  weekStart.setDate(weekStart.getDate() - 6);
+  weekStart.setHours(0, 0, 0, 0);
+
+  const weekStartDate = getLocalDateKey(weekStart);
+  const weekStartISO = weekStart.toISOString();
 
   const [
     moodTodayRes,
     activitiesTodayRes,
+    todaySessionsRes,
     weekSessionsRes,
     weekMoodsRes,
     recentSessionsRes,
@@ -54,7 +85,7 @@ export async function fetchWellnessMetrics(userId: string): Promise<WellnessMetr
       .from("mood_logs")
       .select("mood, energy, stress, note, logged_at")
       .eq("user_id", userId)
-      .eq("log_date", today)
+      .eq("log_date", today.dateKey)
       .order("logged_at", { ascending: false })
       .limit(1)
       .maybeSingle(),
@@ -63,113 +94,184 @@ export async function fetchWellnessMetrics(userId: string): Promise<WellnessMetr
       .from("daily_activities")
       .select("duration_minutes, completed")
       .eq("user_id", userId)
-      .eq("activity_date", today),
+      .eq("activity_date", today.dateKey),
+
+    // Primary source for today's completed exercise time.
+    supabase
+      .from("wellness_sessions")
+      .select("id, duration_seconds, completed, started_at")
+      .eq("user_id", userId)
+      .eq("completed", true)
+      .gte("started_at", today.startISO)
+      .lt("started_at", today.endISO),
 
     supabase
       .from("wellness_sessions")
       .select("duration_seconds, completed, started_at")
       .eq("user_id", userId)
-      .gte("started_at", weekAgoISO),
+      .gte("started_at", weekStartISO)
+      .lt("started_at", now.toISOString()),
 
     supabase
       .from("mood_logs")
       .select("mood, log_date")
       .eq("user_id", userId)
-      .gte("log_date", weekAgo.toISOString().split("T")[0]),
+      .gte("log_date", weekStartDate)
+      .lte("log_date", today.dateKey),
 
     supabase
       .from("wellness_sessions")
       .select(
         `id, duration_seconds, completed, started_at, category,
-         exercises ( title, icon )`
+         exercises ( title, icon )`,
       )
       .eq("user_id", userId)
       .order("started_at", { ascending: false })
       .limit(5),
   ]);
 
-  // -------- Today activities --------
-  const activities = activitiesTodayRes.data ?? [];
-  const completedActivities = activities.filter((a) => a.completed);
+  // Surface database failures rather than silently displaying false zeros.
+  const results = [
+    moodTodayRes,
+    activitiesTodayRes,
+    todaySessionsRes,
+    weekSessionsRes,
+    weekMoodsRes,
+    recentSessionsRes,
+  ];
 
-  // -------- Weekly sessions --------
+  const failedQuery = results.find((result) => result.error);
+
+  if (failedQuery?.error) {
+    throw failedQuery.error;
+  }
+
+  const activities = activitiesTodayRes.data ?? [];
+  const completedActivities = activities.filter((activity) => activity.completed);
+
+  const todaySessions = todaySessionsRes.data ?? [];
   const weekSessions = weekSessionsRes.data ?? [];
-  const completedSessions = weekSessions.filter((s) => s.completed);
-  const totalSeconds = completedSessions.reduce(
-    (sum, s) => sum + (s.duration_seconds ?? 0),
-    0
+  const completedWeekSessions = weekSessions.filter(
+    (session) => session.completed,
+  );
+
+  // Count exercise minutes from completed sessions first.
+  // Fall back to daily_activities when session duration is not available.
+  // Do NOT add both sources together: they may represent the same exercise.
+  const completedSessionSeconds = todaySessions.reduce(
+    (sum, session) => sum + Math.max(0, session.duration_seconds ?? 0),
+    0,
+  );
+
+  const activityMinutes = completedActivities.reduce(
+    (sum, activity) => sum + Math.max(0, activity.duration_minutes ?? 0),
+    0,
+  );
+
+  const sessionMinutes = Math.round(completedSessionSeconds / 60);
+
+  const todayMinutes =
+    completedSessionSeconds > 0 ? sessionMinutes : activityMinutes;
+
+  // Weekly totals.
+  const weeklySeconds = completedWeekSessions.reduce(
+    (sum, session) => sum + Math.max(0, session.duration_seconds ?? 0),
+    0,
   );
 
   const completionRate =
     weekSessions.length > 0
-      ? Math.round((completedSessions.length / weekSessions.length) * 100)
+      ? Math.round(
+          (completedWeekSessions.length / weekSessions.length) * 100,
+        )
       : 0;
 
-  // -------- Streak: consecutive days with a completed session --------
+  // Consecutive local calendar days containing completed sessions.
   const completedDays = new Set(
-    completedSessions.map((s) => s.started_at.split("T")[0])
+    completedWeekSessions.map((session) =>
+      getLocalDateKey(new Date(session.started_at)),
+    ),
   );
+
   let streak = 0;
+
   for (let i = 0; i < 7; i++) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const key = d.toISOString().split("T")[0];
-    if (completedDays.has(key)) streak++;
-    else if (i > 0) break; // allow today missing, break streak if yesterday missing too
+    const date = new Date(now);
+    date.setDate(date.getDate() - i);
+
+    if (completedDays.has(getLocalDateKey(date))) {
+      streak++;
+    } else if (i > 0) {
+      break;
+    }
   }
 
-  // -------- Avg mood this week --------
+  // Average mood over the last seven calendar days.
   const weekMoods = weekMoodsRes.data ?? [];
+
   const avgMood =
     weekMoods.length > 0
       ? Number(
           (
-            weekMoods.reduce((sum, m) => sum + m.mood, 0) / weekMoods.length
-          ).toFixed(1)
+            weekMoods.reduce((sum, mood) => sum + mood.mood, 0) /
+            weekMoods.length
+          ).toFixed(1),
         )
       : null;
 
-  // -------- Recent sessions (normalize) --------
-  const recentSessions = (recentSessionsRes.data ?? []).map((s: any) => ({
-    id: s.id,
-    title: s.exercises?.title ?? "Session",
-    icon: s.exercises?.icon ?? "🧘",
-    category: s.category,
-    duration_seconds: s.duration_seconds ?? 0,
-    completed: s.completed,
-    started_at: s.started_at,
-  }));
+  // Normalize recent sessions for the existing Home UI.
+  const recentSessions = (recentSessionsRes.data ?? []).map((session: any) => {
+    const exercise = Array.isArray(session.exercises)
+      ? session.exercises[0]
+      : session.exercises;
+
+    return {
+      id: session.id,
+      title: exercise?.title ?? "Wellness session",
+      icon: exercise?.icon ?? "🧘",
+      category: session.category ?? null,
+      duration_seconds: session.duration_seconds ?? 0,
+      completed: Boolean(session.completed),
+      started_at: session.started_at,
+    };
+  });
 
   return {
     todayMood: moodTodayRes.data ?? null,
+
     todayActivities: {
-      total: activities.length,
-      completed: completedActivities.length,
-      totalMinutes: completedActivities.reduce(
-        (sum, a) => sum + (a.duration_minutes ?? 0),
-        0
-      ),
+      // Use session counts if activity rows were never created.
+      total: activities.length > 0 ? activities.length : todaySessions.length,
+      completed:
+        activities.length > 0
+          ? completedActivities.length
+          : todaySessions.length,
+      totalMinutes: todayMinutes,
     },
+
     weeklyStats: {
-      sessionsCount: completedSessions.length,
-      totalMinutes: Math.round(totalSeconds / 60),
+      sessionsCount: completedWeekSessions.length,
+      totalMinutes: Math.round(weeklySeconds / 60),
       completionRate,
       streakDays: streak,
       avgMood,
     },
+
     recentSessions,
   };
 }
 
-// -------- Featured exercises --------
 export async function fetchFeaturedExercises(limit = 4) {
   const { data, error } = await supabase
     .from("exercises")
-    .select("id, title, description, category, icon, duration_minutes, difficulty")
+    .select(
+      "id, title, description, category, icon, duration_minutes, difficulty",
+    )
     .eq("is_active", true)
     .order("created_at", { ascending: false })
     .limit(limit);
 
   if (error) throw error;
+
   return data ?? [];
 }

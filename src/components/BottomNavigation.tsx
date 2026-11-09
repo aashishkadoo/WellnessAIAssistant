@@ -1,4 +1,5 @@
 // src/components/BottomNavigation.tsx
+
 import * as React from "react";
 import {
   View,
@@ -10,7 +11,14 @@ import {
   Animated,
   LayoutChangeEvent,
 } from "react-native";
-import { Home, Activity, BarChart3, User } from "lucide-react-native";
+
+import {
+  House,
+  Dumbbell,
+  ChartNoAxesColumnIncreasing,
+  UserRound,
+} from "lucide-react-native";
+
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 type NavItem = {
@@ -24,20 +32,35 @@ type NavItem = {
 };
 
 const NAV_ITEMS: NavItem[] = [
-  { key: "home",     label: "Home",     Icon: Home },
-  { key: "exercise", label: "Exercise", Icon: Activity },
-  { key: "progress", label: "Progress", Icon: BarChart3 },
-  { key: "profile",  label: "Profile",  Icon: User },
+  {
+    key: "home",
+    label: "Home",
+    Icon: House,
+  },
+  {
+    key: "exercise",
+    label: "Exercise",
+    Icon: Dumbbell,
+  },
+  {
+    key: "progress",
+    label: "Progress",
+    Icon: ChartNoAxesColumnIncreasing,
+  },
+  {
+    key: "profile",
+    label: "Profile",
+    Icon: UserRound,
+  },
 ];
 
 type Props = {
   currentScreen: string;
   onNavigate: (screen: string) => void;
+
   /**
-   * Fires with the bar's real, measured height (including safe-area
-   * padding) every time it changes — e.g. on rotation. Use this instead of
-   * a hardcoded constant when positioning things like a FloatingChatbot
-   * above the bar, so they never overlap on devices with different insets.
+   * Reports the navigation wrapper's measured height,
+   * including its safe-area padding.
    */
   onHeightChange?: (height: number) => void;
 };
@@ -55,16 +78,26 @@ export default function BottomNavigation({
   const insets = useSafeAreaInsets();
 
   const isLandscape = width > height;
-  const iconSize  = isLandscape ? 20 : width < 360 ? 20 : width > 500 ? 26 : 22;
-  const labelSize = isLandscape ? 10 : width < 360 ? 10 : 11.5;
 
-  // Enough room for: circle indicator + gap + one line of label + top/bottom
-  // padding, with a few px of buffer so nothing touches or overlaps.
+  const iconSize = isLandscape
+    ? 20
+    : width < 360
+      ? 20
+      : width > 500
+        ? 26
+        : 22;
+
+  const labelSize = isLandscape
+    ? 10
+    : width < 360
+      ? 10
+      : 11.5;
+
   const barHeight = isLandscape ? 68 : 78;
   const circleSize = iconSize + 20;
 
-  const handleLayout = (e: LayoutChangeEvent) => {
-    onHeightChange?.(e.nativeEvent.layout.height);
+  const handleLayout = (event: LayoutChangeEvent) => {
+    onHeightChange?.(event.nativeEvent.layout.height);
   };
 
   return (
@@ -73,7 +106,9 @@ export default function BottomNavigation({
       onLayout={handleLayout}
       style={[
         styles.wrapper,
-        { paddingBottom: insets.bottom + (isLandscape ? 6 : 10) },
+        {
+          paddingBottom: insets.bottom + (isLandscape ? 6 : 10),
+        },
       ]}
     >
       <View
@@ -121,17 +156,29 @@ function NavButton({
   labelSize,
   circleSize,
 }: NavButtonProps) {
-  // Drives the circular indicator's scale/opacity behind the icon.
-  const progress = React.useRef(new Animated.Value(active ? 1 : 0)).current;
-  const pressScale = React.useRef(new Animated.Value(1)).current;
+  // Animated active indicator.
+  const progress = React.useRef(
+    new Animated.Value(active ? 1 : 0)
+  ).current;
+
+  // Animated press feedback.
+  const pressScale = React.useRef(
+    new Animated.Value(1)
+  ).current;
 
   React.useEffect(() => {
-    Animated.spring(progress, {
+    const animation = Animated.spring(progress, {
       toValue: active ? 1 : 0,
       useNativeDriver: true,
       friction: 7,
       tension: 90,
-    }).start();
+    });
+
+    animation.start();
+
+    return () => {
+      animation.stop();
+    };
   }, [active, progress]);
 
   const handlePressIn = () => {
@@ -174,9 +221,20 @@ function NavButton({
       hitSlop={8}
     >
       <Animated.View
-        style={[styles.iconRow, { transform: [{ scale: pressScale }] }]}
+        style={[
+          styles.iconRow,
+          {
+            transform: [{ scale: pressScale }],
+          },
+        ]}
       >
-        <View style={{ width: circleSize, height: circleSize }}>
+        <View
+          style={{
+            width: circleSize,
+            height: circleSize,
+          }}
+        >
+          {/* Circular highlight for the active screen. */}
           <Animated.View
             pointerEvents="none"
             style={[
@@ -184,12 +242,14 @@ function NavButton({
               {
                 width: circleSize,
                 height: circleSize,
-                borderRadius: circleSize / 2, // always a perfect circle
+                borderRadius: circleSize / 2,
                 opacity: progress,
                 transform: [{ scale: circleScale }],
               },
             ]}
           />
+
+          {/* Lucide navigation icon. */}
           <View style={styles.iconCenter}>
             <Icon
               size={iconSize}
@@ -200,6 +260,7 @@ function NavButton({
         </View>
       </Animated.View>
 
+      {/* Navigation label. */}
       <Text
         style={[
           styles.label,
@@ -223,6 +284,7 @@ const styles = StyleSheet.create({
   wrapper: {
     backgroundColor: "transparent",
   },
+
   container: {
     backgroundColor: "#FFFFFF",
     borderRadius: 24,
@@ -230,37 +292,48 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-around",
+
     ...Platform.select({
-      android: { elevation: 12 },
+      android: {
+        elevation: 12,
+      },
       ios: {
         shadowColor: "#0B2E1F",
-        shadowOffset: { width: 0, height: 8 },
+        shadowOffset: {
+          width: 0,
+          height: 8,
+        },
         shadowOpacity: 0.12,
         shadowRadius: 20,
       },
     }),
   },
+
   item: {
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
     paddingVertical: 4,
-    minWidth: 0, // lets long labels ("Exercise", "Progress") shrink instead of pushing siblings
+    minWidth: 0,
   },
+
   iconRow: {
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 4,
   },
+
   circle: {
     position: "absolute",
     backgroundColor: ACTIVE_BG,
   },
+
   iconCenter: {
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
   },
+
   label: {
     letterSpacing: 0.2,
     textAlign: "center",

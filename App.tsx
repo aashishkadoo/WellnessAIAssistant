@@ -1,19 +1,25 @@
 // App.tsx
-
 import React, {
+  memo,
   useCallback,
   useEffect,
   useState,
 } from "react";
+
 import {
   ActivityIndicator,
   StyleSheet,
   View,
 } from "react-native";
+
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import {
+  initializeDatabase,
+  inspectDatabaseSchema,
+} from "./src/database/database";
+
 import { supabase } from "./src/lib/supabase";
-import { initializeDatabase } from "./src/database/database";
 
 import LoginScreen from "./src/screens/LoginScreen";
 import WellnessHome from "./src/screens/WellnessHome";
@@ -41,6 +47,14 @@ type AuthStatus =
 
 type VisitedScreens = Record<ScreenKey, boolean>;
 
+type AppSession = Awaited<
+  ReturnType<typeof supabase.auth.getSession>
+>["data"]["session"];
+
+type ScreenProps = {
+  user: NonNullable<AppSession>["user"];
+};
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -57,49 +71,68 @@ const INITIAL_VISITED_SCREENS: VisitedScreens = {
 };
 
 // ============================================================================
+// MEMOIZED SCREENS
+// ============================================================================
+
+// React.memo prevents a screen from re-rendering when its props have not
+// changed. This is particularly useful when another screen becomes active.
+
+const MemoWellnessHome = memo(WellnessHome);
+const MemoExerciseScreen = memo(ExerciseScreen);
+const MemoProgressScreen = memo(ProgressScreen);
+const MemoProfileScreen = memo(ProfileScreen);
+
+// ============================================================================
 // APP
 // ============================================================================
 
 export default function App() {
-  // --------------------------------------------------------------------------
-  // APPLICATION INITIALIZATION
-  // --------------------------------------------------------------------------
-
   const [appReady, setAppReady] = useState(false);
+  const [databaseReady, setDatabaseReady] = useState(false);
+
+  const [authStatus, setAuthStatus] =
+    useState<AuthStatus>("initializing");
+
+  const [session, setSession] = useState<AppSession>(null);
+
+  // --------------------------------------------------------------------------
+  // DATABASE INITIALIZATION
+  // --------------------------------------------------------------------------
 
   useEffect(() => {
     let mounted = true;
 
     async function initializeApp() {
       try {
-        // SQLite must be ready before the authenticated application starts.
+        console.log("[App] Starting application initialization...");
+
         await initializeDatabase();
 
-        // Temporary diagnostic message to verify SQLite initialization.
-        console.log("[SQLite] Ready");
+        console.log("[App] SQLite initialization completed");
+
+        // Inspect the schema only after initialization succeeds.
+        inspectDatabaseSchema();
 
         if (mounted) {
-          setAppReady(true);
+          setDatabaseReady(true);
         }
       } catch (error) {
         console.error(
           "[App] Application initialization failed:",
-          error
+          error,
         );
 
-        // We currently keep the app alive even if local database
-        // initialization fails. This prevents a database problem from
-        // completely blocking authentication.
-        //
-        // Later, once offline-first storage is fully integrated, this can
-        // become a proper database error/recovery screen.
+        if (mounted) {
+          setDatabaseReady(false);
+        }
+      } finally {
         if (mounted) {
           setAppReady(true);
         }
       }
     }
 
-    initializeApp();
+    void initializeApp();
 
     return () => {
       mounted = false;
@@ -109,12 +142,6 @@ export default function App() {
   // --------------------------------------------------------------------------
   // AUTHENTICATION
   // --------------------------------------------------------------------------
-
-  const [authStatus, setAuthStatus] =
-    useState<AuthStatus>("initializing");
-
-  const [session, setSession] =
-    useState<any>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -141,12 +168,12 @@ export default function App() {
         setAuthStatus(
           currentSession?.user
             ? "authenticated"
-            : "unauthenticated"
+            : "unauthenticated",
         );
       } catch (error) {
         console.error(
           "[Auth] Failed to initialize session:",
-          error
+          error,
         );
 
         if (!mounted) {
@@ -158,7 +185,7 @@ export default function App() {
       }
     }
 
-    initializeAuth();
+    void initializeAuth();
 
     const {
       data: { subscription },
@@ -170,12 +197,12 @@ export default function App() {
 
         setSession(nextSession);
 
-        if (nextSession?.user) {
-          setAuthStatus("authenticated");
-        } else {
-          setAuthStatus("unauthenticated");
-        }
-      }
+        setAuthStatus(
+          nextSession?.user
+            ? "authenticated"
+            : "unauthenticated",
+        );
+      },
     );
 
     return () => {
@@ -185,13 +212,15 @@ export default function App() {
   }, []);
 
   // --------------------------------------------------------------------------
-  // APP GATE
+  // APPLICATION GATE
   // --------------------------------------------------------------------------
 
   if (!appReady || authStatus === "initializing") {
     return <AppLoadingScreen />;
   }
 
+  // Keep authentication accessible if SQLite fails to initialize.
+  // Database-dependent features should handle database errors themselves.
   if (authStatus === "unauthenticated" || !session?.user) {
     return <UnauthenticatedApp />;
   }
@@ -199,6 +228,7 @@ export default function App() {
   return (
     <AuthenticatedApp
       session={session}
+      databaseReady={databaseReady}
     />
   );
 }
@@ -225,26 +255,17 @@ function AppLoadingScreen() {
 // ============================================================================
 
 function UnauthenticatedApp() {
-  const handleLogin = useCallback(
-    (sessionData: any) => {
-      // LoginScreen remains compatible with the existing onLogin prop.
-      //
-      // The Supabase auth listener remains the actual source of truth.
-      // This callback simply allows LoginScreen to continue working without
-      // requiring a navigation/auth architecture rewrite.
-      console.log(
-        "[Auth] Login callback received:",
-        Boolean(sessionData)
-      );
-    },
-    []
-  );
+  const handleLogin = useCallback((sessionData: unknown) => {
+    // The Supabase auth-state listener manages the actual session.
+    console.log(
+      "[Auth] Login callback received:",
+      Boolean(sessionData),
+    );
+  }, []);
 
   return (
     <SafeAreaProvider>
-      <LoginScreen
-        onLogin={handleLogin}
-      />
+      <LoginScreen onLogin={handleLogin} />
     </SafeAreaProvider>
   );
 }
@@ -255,73 +276,91 @@ function UnauthenticatedApp() {
 
 function AuthenticatedApp({
   session,
+  databaseReady,
 }: {
-  session: any;
+  session: NonNullable<AppSession>;
+  databaseReady: boolean;
 }) {
   const user = session.user;
 
   // --------------------------------------------------------------------------
-  // NAVIGATION
+  // NAVIGATION STATE
   // --------------------------------------------------------------------------
 
-  const [
-    currentScreen,
-    setCurrentScreen,
-  ] = useState<ScreenKey>("home");
+  const [currentScreen, setCurrentScreen] =
+    useState<ScreenKey>("home");
 
-  const [
-    visitedScreens,
-    setVisitedScreens,
-  ] = useState<VisitedScreens>(
-    INITIAL_VISITED_SCREENS
-  );
+  const [visitedScreens, setVisitedScreens] =
+    useState<VisitedScreens>(INITIAL_VISITED_SCREENS);
 
-  const navigate = useCallback(
-    (screen: ScreenKey) => {
-      setVisitedScreens((previous) => {
-        if (previous[screen]) {
-          return previous;
-        }
+  // Update only the state that actually needs to change.
+  const navigate = useCallback((screen: ScreenKey) => {
+    setCurrentScreen((current) =>
+      current === screen ? current : screen,
+    );
 
-        return {
-          ...previous,
-          [screen]: true,
-        };
-      });
+    setVisitedScreens((previous) => {
+      if (previous[screen]) {
+        return previous;
+      }
 
-      setCurrentScreen(screen);
-    },
-    []
-  );
+      return {
+        ...previous,
+        [screen]: true,
+      };
+    });
+  }, []);
+
+  // --------------------------------------------------------------------------
+  // STABLE HOME CALLBACKS
+  // --------------------------------------------------------------------------
+
+  const openExercise = useCallback(() => {
+    navigate("exercise");
+  }, [navigate]);
+
+  const openProgress = useCallback(() => {
+    navigate("progress");
+  }, [navigate]);
+
+  const openProfile = useCallback(() => {
+    navigate("profile");
+  }, [navigate]);
 
   // --------------------------------------------------------------------------
   // TAB BAR
   // --------------------------------------------------------------------------
 
-  const [
-    tabBarHeight,
-    setTabBarHeight,
-  ] = useState(TAB_BAR_HEIGHT);
+  const [tabBarHeight, setTabBarHeight] =
+    useState(TAB_BAR_HEIGHT);
 
-  const handleTabBarHeightChange =
-    useCallback((height: number) => {
+  const handleTabBarHeightChange = useCallback(
+    (height: number) => {
       if (!Number.isFinite(height) || height <= 0) {
         return;
       }
 
       setTabBarHeight((previousHeight) => {
-        if (
-          Math.abs(previousHeight - height) <= 0.5
-        ) {
+        if (Math.abs(previousHeight - height) <= 0.5) {
           return previousHeight;
         }
 
         return height;
       });
-    }, []);
+    },
+    [],
+  );
 
-  const chatbotBottomOffset =
-    tabBarHeight + CHATBOT_GAP;
+  const handleNavigate = useCallback(
+    (screen: string) => {
+      if (isScreenKey(screen)) {
+        navigate(screen);
+      }
+    },
+    [navigate],
+  );
+
+  const chatbotBottomOffset = tabBarHeight + CHATBOT_GAP;
 
   // --------------------------------------------------------------------------
   // RENDER
@@ -330,87 +369,66 @@ function AuthenticatedApp({
   return (
     <SafeAreaProvider>
       <View style={styles.container}>
+        {/* Screen container */}
+
         <View style={styles.screenHost}>
           {visitedScreens.home && (
-            <ScreenSlot
-              active={currentScreen === "home"}
-            >
-              <WellnessHome
+            <ScreenSlot active={currentScreen === "home"}>
+              <MemoWellnessHome
                 user={user}
                 bottomOffset={tabBarHeight}
-                onOpenBreathing={() =>
-                  navigate("exercise")
-                }
-                onOpenExercise={() =>
-                  navigate("exercise")
-                }
-                onOpenProgress={() =>
-                  navigate("progress")
-                }
-                onOpenMood={() =>
-                  navigate("progress")
-                }
-                onOpenProfile={() =>
-                  navigate("profile")
-                }
+                onOpenBreathing={openExercise}
+                onOpenExercise={openExercise}
+                onOpenProgress={openProgress}
+                onOpenMood={openProgress}
+                onOpenProfile={openProfile}
               />
             </ScreenSlot>
           )}
 
           {visitedScreens.exercise && (
-            <ScreenSlot
-              active={
-                currentScreen === "exercise"
-              }
-            >
-              <ExerciseScreen
-                user={user}
-              />
+            <ScreenSlot active={currentScreen === "exercise"}>
+              <MemoExerciseScreen user={user} />
             </ScreenSlot>
           )}
 
           {visitedScreens.progress && (
-            <ScreenSlot
-              active={
-                currentScreen === "progress"
-              }
-            >
-              <ProgressScreen
-                user={user}
-              />
+            <ScreenSlot active={currentScreen === "progress"}>
+              <MemoProgressScreen user={user} />
             </ScreenSlot>
           )}
 
           {visitedScreens.profile && (
-            <ScreenSlot
-              active={
-                currentScreen === "profile"
-              }
-            >
-              <ProfileScreen
-                user={user}
-              />
+            <ScreenSlot active={currentScreen === "profile"}>
+              <MemoProfileScreen user={user} />
             </ScreenSlot>
           )}
         </View>
 
+        {/* Persistent bottom navigation */}
+
         <BottomNavigation
           currentScreen={currentScreen}
-          onNavigate={(screen) => {
-            if (isScreenKey(screen)) {
-              navigate(screen);
-            }
-          }}
-          onHeightChange={
-            handleTabBarHeightChange
-          }
+          onNavigate={handleNavigate}
+          onHeightChange={handleTabBarHeightChange}
         />
 
+        {/* Persistent chatbot */}
+
         <FloatingChatbot
-          bottomOffset={
-            chatbotBottomOffset
-          }
+          bottomOffset={chatbotBottomOffset}
         />
+
+        {/* Small offline/database warning indicator */}
+
+        {!databaseReady && (
+          <View
+            pointerEvents="none"
+            style={styles.databaseWarning}
+          >
+            <View style={styles.warningDot} />
+          </View>
+        )}
       </View>
     </SafeAreaProvider>
   );
@@ -434,18 +452,10 @@ function ScreenSlot({
           ? styles.slotActive
           : styles.slotHidden
       }
-      pointerEvents={
-        active
-          ? "auto"
-          : "none"
-      }
-      accessibilityElementsHidden={
-        !active
-      }
+      pointerEvents={active ? "auto" : "none"}
+      accessibilityElementsHidden={!active}
       importantForAccessibility={
-        active
-          ? "auto"
-          : "no-hide-descendants"
+        active ? "auto" : "no-hide-descendants"
       }
     >
       {children}
@@ -457,9 +467,7 @@ function ScreenSlot({
 // TYPE GUARD
 // ============================================================================
 
-function isScreenKey(
-  value: unknown
-): value is ScreenKey {
+function isScreenKey(value: unknown): value is ScreenKey {
   return (
     value === "home" ||
     value === "exercise" ||
@@ -497,6 +505,26 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: "#F5FAF7",
   },
+
+  databaseWarning: {
+    position: "absolute",
+    top: 8,
+    right: 8,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  warningDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
 });
 
-// npx react-native run-android
+//  npx react-native run-android
+
+// cd C:\Users\Lenovo\Desktop\WellnessAIAssistant\android
+// .\gradlew.bat assembleRelease
